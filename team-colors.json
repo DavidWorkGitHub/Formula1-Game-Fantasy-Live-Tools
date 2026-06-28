@@ -1,4 +1,4 @@
 {
-  "AUD": { "name": "Audi", "color": "#00e701" },
-  "CAD": { "name": "Cadillac", "color": "#c9a646" }
+  "AUD": { "name": "Audi", "color": "#ff2e01" },
+  "CAD": { "name": "Cadillac", "color": "#777777" }
 }

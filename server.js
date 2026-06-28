@@ -70,8 +70,8 @@ const DRIVER_META = {
 
 const TEAM_META = {
   MER:{name:'Mercedes', color:'#00d2be'}, RED:{name:'Red Bull', color:'#1e41ff'}, FER:{name:'Ferrari', color:'#e10600'}, MCL:{name:'McLaren', color:'#ff8700'},
-  VRB:{name:'Racing Bulls', color:'#2b6cff'}, ALP:{name:'Alpine', color:'#ff87bc'}, AUD:{name:'Audi', color:'#00e701'}, HAA:{name:'Haas', color:'#ffffff'},
-  AST:{name:'Aston Martin', color:'#006f62'}, WIL:{name:'Williams', color:'#00a0de'}, CAD:{name:'Cadillac', color:'#c9a646'}, CR:{name:'Custom Team', color:'#777777'}
+  VRB:{name:'Racing Bulls', color:'#2b6cff'}, ALP:{name:'Alpine', color:'#ff87bc'}, AUD:{name:'Audi', color:'#ff2e01'}, HAA:{name:'Haas', color:'#ffffff'},
+  AST:{name:'Aston Martin', color:'#006f62'}, WIL:{name:'Williams', color:'#00a0de'}, CAD:{name:'Cadillac', color:'#777777'}, CR:{name:'Custom Team', color:'#777777'}
 };
 
 try {
@@ -505,6 +505,10 @@ function weekendDriverRows() {
       overtakes: rr ? Number(rr.overtakes || 0) : 0,
       fastestLapBonus: rr ? Number(rr.fastestLapBonus || 0) : 0,
       dotdBonus: rr ? Number(rr.dotdBonus || 0) : 0,
+      raceBadPenalty: rr ? Number(rr.badPenalty || 0) : 0,
+      sprintBadPenalty: sr ? Number(sr.badPenalty || 0) : 0,
+      sprintQualifyingBadPenalty: sqr ? Number(sqr.badPenalty || 0) : 0,
+      qBadPenalty: qr ? Number(qr.badPenalty || 0) : 0,
       badPenalty: (rr ? Number(rr.badPenalty || 0) : 0) + (sr ? Number(sr.badPenalty || 0) : 0) + (sqr ? Number(sqr.badPenalty || 0) : 0) + (qr ? Number(qr.badPenalty || 0) : 0),
       qTotal,
       sprintQualifyingTotal,
