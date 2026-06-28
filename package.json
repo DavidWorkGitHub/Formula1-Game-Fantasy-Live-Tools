@@ -1,0 +1,13 @@
+{
+  "name": "f1-25-fantasy-live",
+  "version": "0.1.0",
+  "description": "Local F1 25 UDP telemetry receiver with live fantasy scoring dashboard.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "simulate": "node simulate.js"
+  },
+  "keywords": ["f1-25", "udp", "telemetry", "fantasy"],
+  "author": "",
+  "license": "MIT"
+}
