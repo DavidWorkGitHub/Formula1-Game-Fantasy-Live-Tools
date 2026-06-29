@@ -10,6 +10,7 @@ const HEADER_SIZE = 29;
 const LAP_DATA_SIZE = 57;
 const FINAL_CLASSIFICATION_SIZE = 46;
 const PARTICIPANT_SIZE = 58;
+const HISTORY_FILE = path.join(__dirname, 'fantasy-history.json');
 
 const PACKET = {
   0: 'Motion', 1: 'Session', 2: 'Lap Data', 3: 'Event', 4: 'Participants',
@@ -35,6 +36,12 @@ const RACE_QUALIFYING_SESSION_IDS = new Set([5,6,7,8,9]);
 const SPRINT_QUALIFYING_SESSION_IDS = new Set([10,11,12,13,14]);
 const QUALIFYING_SESSION_IDS = new Set([...RACE_QUALIFYING_SESSION_IDS, ...SPRINT_QUALIFYING_SESSION_IDS]);
 const RACE_SESSION_IDS = new Set([15,16,17]);
+const WEEKEND_FLOWS = {
+  standard: ['qualifying','race'],
+  sprint: ['sprintQualifying','sprint','qualifying','race']
+};
+const PHASE_LABELS = { sprintQualifying:'Sprint Qualifying', sprint:'Sprint Race', qualifying:'Race Qualifying', race:'Race' };
+
 
 const TEAM_CODES_BY_ID = {
   0:'MER',1:'FER',2:'RED',3:'WIL',4:'AST',5:'ALP',6:'VRB',7:'HAA',8:'MCL',9:'AUD',
@@ -104,6 +111,9 @@ const state = {
   sprintFinal: [],
   session: { type: 0, name: 'Unknown', kind: 'unknown', totalLaps: 0, trackId: null },
   manualKind: 'auto',
+  weekendType: 'sprint',
+  currentPhase: 'sprintQualifying',
+  completedPhases: {},
   dotdIndex: null,
   events: [],
   fastestLap: null,
@@ -111,6 +121,8 @@ const state = {
   overtakes: Array(22).fill(0),
   driverBestPitstop: Array(22).fill(null),
   history: { drivers: {}, constructors: {} },
+  raceHistory: [],
+  selectedHistoryId: null,
   lastFinalKey: '',
   udpBound: false,
   udpError: null,
@@ -119,6 +131,81 @@ const state = {
   packetBytes: 0,
 };
 const clients = new Set();
+loadSavedHistory();
+
+
+function loadSavedHistory() {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
+    if (data && typeof data === 'object') {
+      state.history = data.summaryHistory || data.history || state.history;
+      state.raceHistory = Array.isArray(data.races) ? data.races : [];
+    }
+  } catch (err) {
+    console.warn('Could not load fantasy-history.json:', err.message);
+  }
+}
+
+function saveSavedHistory() {
+  const payload = {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    summaryHistory: state.history,
+    races: state.raceHistory || []
+  };
+  fs.writeFileSync(HISTORY_FILE, JSON.stringify(payload, null, 2));
+}
+
+function upsertSummaryHistory(record) {
+  const round = Number(record.round || currentRound());
+  for (const r of record.drivers || []) {
+    const id = r.code || `C${r.index}`;
+    if (!state.history.drivers[id]) state.history.drivers[id] = { code: r.code, name: r.fullName || r.name || id, team: r.team, rounds: {} };
+    state.history.drivers[id].rounds[round] = Number(r.total || r.fantasy || 0);
+  }
+  for (const c of record.constructors || []) {
+    if (!state.history.constructors[c.code]) state.history.constructors[c.code] = { code: c.code, name: c.name || c.code, rounds: {} };
+    state.history.constructors[c.code].rounds[round] = Number(c.total || 0);
+  }
+}
+
+function buildWeekendRecord(customName) {
+  const drivers = weekendDriverRows();
+  const constructors = weekendConstructorsSnapshot();
+  const hasSprint = drivers.some(d => Number(d.sprintQualifyingTotal || 0) !== 0 || Number(d.sprintTotal || 0) !== 0 || d.sprintQualifyingPosition || d.sprintPosition);
+  const round = currentRound();
+  const name = String(customName || '').trim() || `Round ${round}`;
+  const dotd = state.dotdIndex == null ? null : driverDisplay(state.dotdIndex);
+  return {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    name,
+    round,
+    type: hasSprint ? 'Sprint Weekend' : 'Race Weekend',
+    savedAt: new Date().toISOString(),
+    sessionUID: state.sessionUID,
+    sessionName: state.session.name,
+    dotd,
+    fastestLap: state.fastestLap ? { ...state.fastestLap, time: formatMs(state.fastestLap.ms) } : null,
+    drivers,
+    constructors
+  };
+}
+
+function saveCurrentWeekend(customName) {
+  const record = buildWeekendRecord(customName);
+  state.raceHistory = [record, ...(state.raceHistory || [])].slice(0, 200);
+  state.selectedHistoryId = record.id;
+  upsertSummaryHistory(record);
+  saveSavedHistory();
+  addEvent(`Saved ${record.name} to Race History`);
+  return record;
+}
+
+function getSelectedHistory() {
+  if (!state.selectedHistoryId && state.raceHistory && state.raceHistory.length) state.selectedHistoryId = state.raceHistory[0].id;
+  return (state.raceHistory || []).find(r => r.id === state.selectedHistoryId) || null;
+}
 
 function defaultParticipant(i) {
   return { index: i, driverId: 255, teamId: 255, raceNumber: 0, name: `CAR ${i}`, fullName: `Car ${i}`, code: `C${i}`, team: 'CR', teamName: 'Custom Team' };
@@ -182,17 +269,23 @@ function parseSession(buf) {
   const sessionType = buf.readUInt8(HEADER_SIZE + 6);
   const trackId = buf.readInt8(HEADER_SIZE + 7);
   const name = SESSION_TYPES[sessionType] || `Session ${sessionType}`;
-  const autoKind = SPRINT_QUALIFYING_SESSION_IDS.has(sessionType) ? 'sprintQualifying' : RACE_QUALIFYING_SESSION_IDS.has(sessionType) ? 'qualifying' : RACE_SESSION_IDS.has(sessionType) ? 'race' : 'practice';
+  const detectedKind = SPRINT_QUALIFYING_SESSION_IDS.has(sessionType) ? 'sprintQualifying' : RACE_QUALIFYING_SESSION_IDS.has(sessionType) ? 'qualifying' : RACE_SESSION_IDS.has(sessionType) ? 'race' : 'practice';
+  const autoKind = resolveAutoKind(detectedKind);
   const previousType = state.session.type;
   const previousUid = state.sessionUID;
-  state.session = { type: sessionType, name, autoKind, kind: scoringKind(autoKind), totalLaps, trackId };
+  state.session = { type: sessionType, name, detectedKind, autoKind, kind: scoringKind(autoKind), totalLaps, trackId };
   if (previousType !== sessionType || previousUid !== state.sessionUID) {
+    const phase = ensureCurrentPhase();
+    if (!state.completedPhases[phase] && hasSessionRows(state.final && state.final.length ? state.final : state.cars)) {
+      freezePhaseRows(phase, `Auto-preserved ${PHASE_LABELS[phase] || phase} points before session changed.`);
+    }
     state.final = [];
+    state.cars = [];
     state.fastestLap = null;
     state.overtakes = Array(22).fill(0);
     state.driverBestPitstop = Array(22).fill(null);
     state.lastFinalKey = '';
-    addEvent(`Session detected: ${name} (${state.session.kind})`);
+    addEvent(`Session detected: ${name}. Detected ${detectedKind}; scoring as ${state.session.kind} (${PHASE_LABELS[state.currentPhase] || state.currentPhase})`);
   }
 }
 
@@ -320,7 +413,7 @@ function parseFinalClassification(buf) {
     const row = {
       index: i,
       position: buf.readUInt8(o), laps: buf.readUInt8(o + 1), grid: buf.readUInt8(o + 2), gamePoints: buf.readUInt8(o + 3), pitStops: buf.readUInt8(o + 4),
-      resultStatus: buf.readUInt8(o + 5), resultReason: buf.readUInt8(o + 6), bestLapMs: buf.readUInt32LE(o + 7), totalRaceTime: buf.readDoubleLE(o + 11),
+      resultStatus: buf.readUInt8(o + 5), resultReason: buf.readUInt8(o + 6), bestLapMs: buf.readUInt32LE(o + 7), totalRaceTime: buf.readDoubleLE(o + 11), isFinalClassification: true,
       penaltiesTime: buf.readUInt8(o + 19), numPenalties: buf.readUInt8(o + 20),
     };
     const d = driverDisplay(i);
@@ -368,19 +461,133 @@ function parseEvent(buf) {
   }
 }
 
+
+function getPhaseRows(phase) {
+  if (phase === 'sprintQualifying') return state.sprintQualifyingFinal || [];
+  if (phase === 'sprint') return state.sprintFinal || [];
+  if (phase === 'qualifying') return state.qualifyingFinal || [];
+  if (phase === 'race') return state.raceFinal || [];
+  return [];
+}
+
+function setPhaseRows(phase, rows) {
+  const lockedRows = Array.isArray(rows) ? rows : [];
+  if (phase === 'sprintQualifying') state.sprintQualifyingFinal = lockedRows;
+  else if (phase === 'sprint') state.sprintFinal = lockedRows;
+  else if (phase === 'qualifying') state.qualifyingFinal = lockedRows;
+  else if (phase === 'race') state.raceFinal = lockedRows;
+}
+
+function hasSessionRows(rows) {
+  return Array.isArray(rows) && rows.some(r => Number(r.position || 0) > 0 || Number(r.fantasy || r.total || 0) !== 0 || Number(r.resultPoints || 0) !== 0 || Number(r.overtakes || 0) !== 0 || Number(r.fastestLapBonus || 0) !== 0);
+}
+
+function freezePhaseRows(phase, reason = '') {
+  const liveRows = state.final && state.final.length ? state.final : (state.cars || []);
+  const savedRows = getPhaseRows(phase);
+  const source = hasSessionRows(liveRows) ? liveRows : savedRows;
+  if (!hasSessionRows(source)) return [];
+
+  // Force a fresh calculation using the CURRENT session context before locking it.
+  // This is the important bit: overtakes and fastest lap live in state.overtakes/state.fastestLap,
+  // so they must be applied before we reset live state for the next session.
+  const calculated = recalcScoredRows(
+    source.map(r => ({ ...r, locked: false, saved: false, isScoringFinal: true })),
+    phase,
+    { force: true, finalize: true }
+  );
+
+  const locked = calculated.map(r => ({
+    ...r,
+    total: Number(r.total ?? r.fantasy ?? 0),
+    fantasy: Number(r.fantasy ?? r.total ?? 0),
+    locked: true,
+    saved: true,
+    sessionKind: phase,
+    savedAt: new Date().toISOString()
+  }));
+  setPhaseRows(phase, locked);
+  if (reason) addEvent(reason);
+  return locked;
+}
+
+function currentFlow() {
+  return WEEKEND_FLOWS[state.weekendType] || WEEKEND_FLOWS.standard;
+}
+
+function ensureCurrentPhase() {
+  const flow = currentFlow();
+  if (!flow.includes(state.currentPhase)) state.currentPhase = flow[0];
+  return state.currentPhase;
+}
+
+function resolveAutoKind(detectedKind) {
+  const flow = currentFlow();
+  const phase = ensureCurrentPhase();
+  if (detectedKind === 'practice') return 'practice';
+  if (state.weekendType === 'sprint') {
+    // F1 25 can report the Sprint Race as a generic Race session. Do not let it jump SQ -> Race.
+    if (detectedKind === 'race' && phase === 'sprint') return 'sprint';
+    if (detectedKind === 'race' && phase !== 'race') return phase;
+    if (flow.includes(detectedKind)) {
+      const detectedPos = flow.indexOf(detectedKind);
+      const phasePos = flow.indexOf(phase);
+      // Only allow the current phase or previous phases. Future phases require Save & Next.
+      if (detectedPos > phasePos) return phase;
+      return detectedKind;
+    }
+    return phase;
+  }
+  if (state.weekendType === 'standard') {
+    if (detectedKind === 'race' && phase !== 'race') return phase;
+    if (detectedKind === 'qualifying' || detectedKind === 'race') return detectedKind;
+  }
+  return detectedKind;
+}
+
+function saveCurrentPhaseAndAdvance() {
+  const phase = ensureCurrentPhase();
+  const locked = freezePhaseRows(phase);
+  if (!locked.length) addEvent(`Nothing to save for ${PHASE_LABELS[phase] || phase} yet.`);
+  state.completedPhases[phase] = true;
+  const flow = currentFlow();
+  const i = flow.indexOf(phase);
+  if (i >= 0 && i < flow.length - 1) {
+    state.currentPhase = flow[i + 1];
+    state.final = [];
+    state.cars = [];
+    state.fastestLap = null;
+    state.overtakes = Array(22).fill(0);
+    state.driverBestPitstop = Array(22).fill(null);
+    state.lastFinalKey = '';
+    addEvent(`Saved ${PHASE_LABELS[phase] || phase}. Waiting for ${PHASE_LABELS[state.currentPhase] || state.currentPhase}.`);
+  } else {
+    addEvent(`Saved ${PHASE_LABELS[phase] || phase}. Weekend ready to save to history.`);
+  }
+  state.session.autoKind = state.currentPhase;
+  state.session.kind = scoringKind(state.session.autoKind);
+  return { phase, nextPhase: state.currentPhase, complete: i === flow.length - 1, savedRows: locked.length };
+}
+
 function scoringKind(autoKind = state.session.autoKind || state.session.kind) {
   return state.manualKind && state.manualKind !== 'auto' ? state.manualKind : autoKind;
 }
 
 function isBadResult(status) { return [4,5,6,7].includes(Number(status)); }
 
-function scoreBreakdown(row, fastest) {
-  const kind = scoringKind();
-  const overtakes = state.overtakes[row.index] || 0;
+function scoreBreakdown(row, fastest, kindOverride = null) {
+  const kind = kindOverride || scoringKind();
+  const overtakes = (row.locked || row.saved) ? Number(row.overtakes || 0) : Number(state.overtakes[row.index] || row.overtakes || 0);
   const isFastest = fastest && fastest.vehicleIdx === row.index;
   const dotdBonus = kind === 'race' && state.dotdIndex === row.index ? 10 : 0;
   if (kind === 'qualifying' || kind === 'sprintQualifying') {
-    const noTimeOrBad = !row.bestLapMs || isBadResult(row.resultStatus);
+    // Qualifying -5 should only be applied once the session has a final/locked result.
+    // During live telemetry many cars briefly report bestLapMs = 0 while the table is still updating;
+    // treating that as No Time caused the -5 bug to come back after refreshes.
+    const badStatus = isBadResult(row.resultStatus);
+    const finalOrLocked = row.isFinalClassification === true || row.locked === true || row.saved === true || row.isScoringFinal === true;
+    const noTime = finalOrLocked && !row.bestLapMs;
+    const noTimeOrBad = badStatus || noTime;
     const resultPoints = noTimeOrBad ? 0 : (QUALI_POINTS[row.position] || 0);
     const badPenalty = noTimeOrBad ? QUALI_BAD_PENALTY : 0;
     return { resultPoints, positionGainLoss: 0, overtakes: 0, fastestLapBonus: 0, dotdBonus: 0, badPenalty, penaltySeconds: 0, total: resultPoints + badPenalty };
@@ -433,15 +640,44 @@ function qualiTeamwork(teamRows) {
 }
 
 
-function recalcScoredRows(rows, kindOverride) {
-  const oldManual = state.manualKind;
-  if (kindOverride) state.manualKind = kindOverride;
+function lockedRowTotal(r) {
+  const pieces = ['resultPoints','positionGainLoss','overtakes','fastestLapBonus','dotdBonus','badPenalty','penaltySeconds'];
+  const hasPieces = pieces.some(k => r[k] !== undefined && r[k] !== null && r[k] !== '');
+  if (!hasPieces) return Number(r.fantasy ?? r.total ?? 0);
+  return Number(r.resultPoints || 0)
+    + Number(r.positionGainLoss || 0)
+    + Number(r.overtakes || 0)
+    + Number(r.fastestLapBonus || 0)
+    + Number(r.dotdBonus || 0)
+    + Number(r.badPenalty || 0);
+}
+
+function recalcScoredRows(rows, kindOverride, options = {}) {
+  const kind = kindOverride || scoringKind();
   const out = (rows || []).map(r => {
-    const b = scoreBreakdown(r, state.fastestLap);
-    return { ...r, ...b, fantasy: b.total };
+    // IMPORTANT: once a session is saved/locked, do NOT rebuild its score from live state.
+    // Live state such as fastestLap/overtakes is reset when moving SQ -> Sprint -> Q -> Race.
+    // Saved rows keep every component: result, position gains/losses, overtakes, fastest lap,
+    // DOTD, bad-result penalties and the total.
+    if (!options.force && (r.locked === true || r.saved === true) && Number.isFinite(Number(r.fantasy ?? r.total))) {
+      const frozenTotal = lockedRowTotal(r);
+      return { ...r, total: frozenTotal, fantasy: frozenTotal, locked: true, saved: true, sessionKind: r.sessionKind || kind };
+    }
+    const rowForScore = options.finalize ? { ...r, isScoringFinal: true } : r;
+    const b = scoreBreakdown(rowForScore, state.fastestLap, kind);
+    return { ...r, ...b, fantasy: b.total, total: b.total, sessionKind: kind };
   });
-  state.manualKind = oldManual;
   return out;
+}
+
+function applyDotdToRaceRows(rows) {
+  return (rows || []).map(r => {
+    const oldDotd = Number(r.dotdBonus || 0);
+    const newDotd = state.dotdIndex === Number(r.index) ? 10 : 0;
+    const base = Number(r.fantasy ?? r.total ?? 0) - oldDotd;
+    const nextTotal = base + newDotd;
+    return { ...r, dotdBonus: newDotd, total: nextTotal, fantasy: nextTotal };
+  });
 }
 
 function latestByIndex(rows) {
@@ -501,9 +737,15 @@ function weekendDriverRows() {
       sprintPoints: sr ? Number(sr.resultPoints || 0) : 0,
       racePosition: rr?.position || null,
       resultPoints: rr ? Number(rr.resultPoints || 0) : 0,
-      positionGainLoss: rr ? Number(rr.positionGainLoss || 0) : 0,
-      overtakes: rr ? Number(rr.overtakes || 0) : 0,
-      fastestLapBonus: rr ? Number(rr.fastestLapBonus || 0) : 0,
+      sprintPositionGainLoss: sr ? Number(sr.positionGainLoss || 0) : 0,
+      sprintOvertakes: sr ? Number(sr.overtakes || 0) : 0,
+      sprintFastestLapBonus: sr ? Number(sr.fastestLapBonus || 0) : 0,
+      racePositionGainLoss: rr ? Number(rr.positionGainLoss || 0) : 0,
+      raceOvertakes: rr ? Number(rr.overtakes || 0) : 0,
+      raceFastestLapBonus: rr ? Number(rr.fastestLapBonus || 0) : 0,
+      positionGainLoss: (sr ? Number(sr.positionGainLoss || 0) : 0) + (rr ? Number(rr.positionGainLoss || 0) : 0),
+      overtakes: (sr ? Number(sr.overtakes || 0) : 0) + (rr ? Number(rr.overtakes || 0) : 0),
+      fastestLapBonus: (sr ? Number(sr.fastestLapBonus || 0) : 0) + (rr ? Number(rr.fastestLapBonus || 0) : 0),
       dotdBonus: rr ? Number(rr.dotdBonus || 0) : 0,
       raceBadPenalty: rr ? Number(rr.badPenalty || 0) : 0,
       sprintBadPenalty: sr ? Number(sr.badPenalty || 0) : 0,
@@ -538,9 +780,15 @@ function weekendConstructorsSnapshot() {
     t.sprintResult += Number(d.sprintPoints || 0);
     t.sprintTotal += Number(d.sprintTotal || 0);
     t.raceResult += Number(d.resultPoints || 0);
-    t.positionGainLoss += Number(d.positionGainLoss || 0);
-    t.overtakes += Number(d.overtakes || 0);
-    t.fastestLapBonus += Number(d.fastestLapBonus || 0);
+    t.sprintPositionGainLoss = (t.sprintPositionGainLoss || 0) + Number(d.sprintPositionGainLoss || 0);
+    t.sprintOvertakes = (t.sprintOvertakes || 0) + Number(d.sprintOvertakes || 0);
+    t.sprintFastestLapBonus = (t.sprintFastestLapBonus || 0) + Number(d.sprintFastestLapBonus || 0);
+    t.racePositionGainLoss = (t.racePositionGainLoss || 0) + Number(d.racePositionGainLoss || 0);
+    t.raceOvertakes = (t.raceOvertakes || 0) + Number(d.raceOvertakes || 0);
+    t.raceFastestLapBonus = (t.raceFastestLapBonus || 0) + Number(d.raceFastestLapBonus || 0);
+    t.positionGainLoss += Number(d.racePositionGainLoss || 0);
+    t.overtakes += Number(d.raceOvertakes || 0);
+    t.fastestLapBonus += Number(d.raceFastestLapBonus || 0);
   }
   const qByTeam = new Map();
   for (const r of recalcScoredRows(state.qualifyingFinal || [], 'qualifying')) {
@@ -668,10 +916,13 @@ function snapshot() {
     ...state,
     teamMeta: TEAM_META,
     localIps: publicIps(), udpPort: UDP_PORT, webPort: WEB_PORT, round: currentRound(),
+    weekendType: state.weekendType, currentPhase: ensureCurrentPhase(), completedPhases: state.completedPhases, weekendFlow: currentFlow(), phaseLabels: PHASE_LABELS,
     constructors: weekendConstructorsSnapshot(),
     driverRows: weekendDriverRows(),
     fastestLapFormatted: state.fastestLap ? { ...state.fastestLap, time: formatMs(state.fastestLap.ms) } : null,
     driversForControls: allDriversForControls(),
+    raceHistory: state.raceHistory || [],
+    selectedHistory: getSelectedHistory(),
   };
 }
 
@@ -704,10 +955,15 @@ udp.on('message', (buf, rinfo) => {
   const oldUid = state.sessionUID;
   state.sessionUID = header.sessionUID;
   if (oldUid && oldUid !== header.sessionUID) {
+    const phase = ensureCurrentPhase();
+    if (!state.completedPhases[phase] && hasSessionRows(state.final && state.final.length ? state.final : state.cars)) {
+      freezePhaseRows(phase, `Auto-preserved ${PHASE_LABELS[phase] || phase} points before new session UID.`);
+    }
     state.overtakes = Array(22).fill(0);
     state.driverBestPitstop = Array(22).fill(null);
     state.fastestLap = null;
     state.final = [];
+    state.cars = [];
   }
   state.packetCounts[header.packetId] = (state.packetCounts[header.packetId] || 0) + 1;
   if (header.packetFormat !== 2025 && header.packetFormat !== 2026) addEvent(`Warning: unsupported UDP format ${header.packetFormat}`);
@@ -733,6 +989,117 @@ udp.bind(UDP_PORT, '0.0.0.0', () => {
   console.log(`Use one of these IPs in F1 25 UDP IP Address: ${publicIps().join(', ') || '127.0.0.1'}`);
 });
 
+
+const SIM_LINEUP = [
+  ['VERSTAPPEN','RED'], ['NORRIS','MCL'], ['PIASTRI','MCL'], ['LECLERC','FER'], ['RUSSELL','MER'], ['HAMILTON','FER'],
+  ['ANTONELLI','MER'], ['ALONSO','AST'], ['ALBON','WIL'], ['SAINZ','WIL'], ['GASLY','ALP'], ['COLAPINTO','ALP'],
+  ['HULKENBERG','AUD'], ['BORTOLETO','AUD'], ['LAWSON','VRB'], ['HADJAR','RED'], ['OCON','HAA'], ['BEARMAN','HAA'],
+  ['STROLL','AST'], ['TSUNODA','VRB'], ['PEREZ','CAD'], ['BOTTAS','CAD']
+];
+
+function ensureSimParticipants() {
+  state.participants = SIM_LINEUP.map(([key, team], index) => {
+    const meta = DRIVER_META[key] || { code: key.slice(0,3), fullName: key, team };
+    return {
+      index,
+      driverId: 250 + index,
+      teamId: index,
+      raceNumber: Number(Object.keys(DRIVER_BY_RACE_NUMBER).find(n => DRIVER_BY_RACE_NUMBER[n] === key) || index + 1),
+      name: meta.code,
+      fullName: meta.fullName,
+      code: meta.code,
+      team: meta.team || team,
+      teamName: TEAM_META[meta.team || team]?.name || team
+    };
+  });
+}
+
+function seededShuffle(arr, seed) {
+  const out = arr.slice();
+  let x = seed || 12345;
+  for (let i = out.length - 1; i > 0; i--) {
+    x = (x * 1664525 + 1013904223) >>> 0;
+    const j = x % (i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+function makeSimRows(kind, seed = Date.now()) {
+  ensureSimParticipants();
+  const indices = state.participants.map(p => p.index);
+  let order;
+  if (kind === 'qualifying' || kind === 'sprintQualifying') {
+    order = seededShuffle(indices, seed).slice();
+  } else {
+    // Use the previous saved grid when possible so PG/PL points make sense.
+    const gridRows = kind === 'sprint' ? state.sprintQualifyingFinal : state.qualifyingFinal;
+    const byGrid = (gridRows || []).slice().sort((a,b)=>Number(a.position||99)-Number(b.position||99)).map(r=>Number(r.index));
+    const base = byGrid.length ? byGrid : seededShuffle(indices, seed - 17);
+    order = seededShuffle(base, seed).slice();
+  }
+  const fastestIndex = order[(Math.abs(seed) % 6)];
+  state.overtakes = Array(22).fill(0);
+  const rows = order.map((idx, pos0) => {
+    const p = state.participants[idx];
+    const position = pos0 + 1;
+    const gridSource = kind === 'sprint' ? state.sprintQualifyingFinal : state.qualifyingFinal;
+    const gridRow = (gridSource || []).find(r => Number(r.index) === idx);
+    const grid = (kind === 'race' || kind === 'sprint') ? Number(gridRow?.position || position) : 0;
+    const noTime = (kind === 'qualifying' || kind === 'sprintQualifying') && position > 18 && ((seed + idx) % 5 === 0);
+    const resultStatus = noTime ? 4 : 3; // 3 = finished/active enough for scoring, 4 = NC-style bad result
+    const overtakes = (kind === 'race' || kind === 'sprint') ? Math.max(0, Math.min(12, grid - position + ((seed + idx) % 4))) : 0;
+    state.overtakes[idx] = overtakes;
+    return {
+      ...driverDisplay(idx),
+      index: idx,
+      position,
+      grid,
+      bestLapMs: noTime ? 0 : 76000 + position * 180 + ((seed + idx) % 120),
+      resultStatus,
+      penaltiesTime: 0,
+      isFinalClassification: true,
+      isScoringFinal: true,
+      overtakes
+    };
+  });
+  state.fastestLap = (kind === 'race' || kind === 'sprint') ? { vehicleIdx: fastestIndex, code: driverDisplay(fastestIndex).code, name: driverDisplay(fastestIndex).fullName, ms: 75432 + (seed % 500) } : null;
+  return recalcScoredRows(rows, kind, { force: true, finalize: true });
+}
+
+function simulateSession(kind, save = false) {
+  ensureSimParticipants();
+  const valid = ['sprintQualifying','sprint','qualifying','race'];
+  if (!valid.includes(kind)) kind = ensureCurrentPhase();
+  state.currentPhase = kind;
+  state.manualKind = kind;
+  state.session.autoKind = kind;
+  state.session.kind = kind;
+  state.session.name = `Simulated ${PHASE_LABELS[kind] || kind}`;
+  state.connected = true;
+  state.lastPacketAt = new Date().toISOString();
+  state.lastRemote = 'simulator';
+  state.packets += 1;
+  const rows = makeSimRows(kind, Date.now() + kind.length * 1000);
+  state.final = rows;
+  state.cars = rows;
+  setPhaseRows(kind, rows);
+  addEvent(`Simulated ${PHASE_LABELS[kind] || kind}${save ? ' and saved it' : ''}.`);
+  if (save) saveCurrentPhaseAndAdvance();
+  return rows;
+}
+
+function simulateFullWeekend() {
+  ensureSimParticipants();
+  state.weekendType = 'sprint';
+  state.completedPhases = {};
+  state.currentPhase = 'sprintQualifying';
+  for (const phase of ['sprintQualifying','sprint','qualifying','race']) {
+    simulateSession(phase, true);
+  }
+  addEvent('Full sprint weekend simulated. Select DOTD if you want, then Save Weekend.');
+}
+
 function sendJson(res, payload) {
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
   res.end(JSON.stringify(payload));
@@ -741,6 +1108,33 @@ function sendJson(res, payload) {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://localhost:${WEB_PORT}`);
   if (url.pathname === '/api/state' || url.pathname === '/api/debug') return sendJson(res, snapshot());
+  if (url.pathname === '/api/weekend-type') {
+    const type = String(url.searchParams.get('type') || 'sprint');
+    if (['standard','sprint'].includes(type)) {
+      state.weekendType = type;
+      state.currentPhase = currentFlow()[0];
+      state.completedPhases = {};
+      state.manualKind = 'auto';
+      state.session.autoKind = state.currentPhase;
+      state.session.kind = scoringKind(state.session.autoKind);
+      addEvent(`Weekend type set to ${type === 'sprint' ? 'Sprint Weekend' : 'Standard Weekend'}. Starting at ${PHASE_LABELS[state.currentPhase]}.`);
+    }
+    return sendJson(res, snapshot());
+  }
+
+  if (url.pathname === '/api/simulate') {
+    const kind = String(url.searchParams.get('kind') || state.currentPhase || 'qualifying');
+    const save = url.searchParams.get('save') === '1';
+    if (kind === 'weekend') simulateFullWeekend();
+    else simulateSession(kind, save);
+    broadcast();
+    return sendJson(res, snapshot());
+  }
+  if (url.pathname === '/api/save-phase') {
+    const result = saveCurrentPhaseAndAdvance();
+    broadcast();
+    return sendJson(res, { ok: true, result, state: snapshot() });
+  }
   if (url.pathname === '/api/mode') {
     const kind = String(url.searchParams.get('kind') || 'auto');
     if (['auto','qualifying','sprintQualifying','sprint','race'].includes(kind)) {
@@ -755,15 +1149,36 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/api/dotd') {
     const value = url.searchParams.get('index');
     state.dotdIndex = value === null || value === '' || value === 'none' ? null : Number(value);
-    state.final = recalcScoredRows(state.final, state.session.kind);
-    state.cars = recalcScoredRows(state.cars, state.session.kind);
-    state.raceFinal = recalcScoredRows(state.raceFinal, 'race');
-    state.sprintFinal = recalcScoredRows(state.sprintFinal, 'sprint');
-    state.sprintQualifyingFinal = recalcScoredRows(state.sprintQualifyingFinal, 'sprintQualifying');
-    state.qualifyingFinal = recalcScoredRows(state.qualifyingFinal, 'qualifying');
+    state.final = recalcScoredRows(state.final, state.session.kind, { force: true });
+    state.cars = recalcScoredRows(state.cars, state.session.kind, { force: true });
+    // DOTD is the only driver-only bonus that may be applied after the race is saved.
+    // Keep the saved race result / FL / overtake / position points intact and only swap the DOTD bonus.
+    state.raceFinal = applyDotdToRaceRows(state.raceFinal);
     addEvent(`Driver of the Day set to ${state.dotdIndex == null ? 'none' : driverDisplay(state.dotdIndex).fullName}`);
     return sendJson(res, snapshot());
   }
+
+  if (url.pathname === '/api/save-weekend') {
+    let name = url.searchParams.get('name') || `Round ${currentRound()}`;
+    const record = saveCurrentWeekend(name);
+    broadcast();
+    return sendJson(res, { ok: true, record, state: snapshot() });
+  }
+  if (url.pathname === '/api/history/select') {
+    const id = String(url.searchParams.get('id') || '');
+    if ((state.raceHistory || []).some(r => r.id === id)) state.selectedHistoryId = id;
+    return sendJson(res, snapshot());
+  }
+  if (url.pathname === '/api/history/delete') {
+    const id = String(url.searchParams.get('id') || '');
+    state.raceHistory = (state.raceHistory || []).filter(r => r.id !== id);
+    if (state.selectedHistoryId === id) state.selectedHistoryId = state.raceHistory[0]?.id || null;
+    saveSavedHistory();
+    addEvent('Deleted saved race from Race History');
+    broadcast();
+    return sendJson(res, snapshot());
+  }
+
   if (url.pathname === '/events') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*' });
     clients.add(res);
