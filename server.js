@@ -11,6 +11,7 @@ const LAP_DATA_SIZE = 57;
 const FINAL_CLASSIFICATION_SIZE = 46;
 const PARTICIPANT_SIZE = 58;
 const HISTORY_FILE = path.join(__dirname, 'fantasy-history.json');
+const AUTOSAVE_FILE = path.join(__dirname, 'fantasy-autosave.json');
 
 const PACKET = {
   0: 'Motion', 1: 'Session', 2: 'Lap Data', 3: 'Event', 4: 'Participants',
@@ -102,6 +103,8 @@ const state = {
   lastRemote: null,
   packetCounts: {},
   participants: Array.from({ length: 22 }, (_, i) => defaultParticipant(i)),
+  playerCarIndex: 255,
+  secondaryPlayerCarIndex: 255,
   carsByIndex: {},
   cars: [],
   final: [],
@@ -132,6 +135,7 @@ const state = {
 };
 const clients = new Set();
 loadSavedHistory();
+loadAutosaveDraft();
 
 
 function loadSavedHistory() {
@@ -155,6 +159,56 @@ function saveSavedHistory() {
     races: state.raceHistory || []
   };
   fs.writeFileSync(HISTORY_FILE, JSON.stringify(payload, null, 2));
+}
+
+
+function autosavePayload() {
+  return {
+    version: 2,
+    savedAt: new Date().toISOString(),
+    weekendType: state.weekendType,
+    currentPhase: state.currentPhase,
+    completedPhases: state.completedPhases,
+    dotdIndex: state.dotdIndex,
+    sessionUID: state.sessionUID,
+    participants: state.participants,
+    sprintQualifyingFinal: state.sprintQualifyingFinal,
+    sprintFinal: state.sprintFinal,
+    qualifyingFinal: state.qualifyingFinal,
+    raceFinal: state.raceFinal,
+    fastestLap: state.fastestLap
+  };
+}
+
+function saveAutosaveDraft(reason = '') {
+  try {
+    fs.writeFileSync(AUTOSAVE_FILE, JSON.stringify(autosavePayload(), null, 2));
+    if (reason) addEvent(reason);
+  } catch (err) {
+    console.warn('Could not write fantasy-autosave.json:', err.message);
+  }
+}
+
+function loadAutosaveDraft() {
+  try {
+    if (!fs.existsSync(AUTOSAVE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(AUTOSAVE_FILE, 'utf8'));
+    if (!data || typeof data !== 'object') return;
+    if (data.weekendType) state.weekendType = data.weekendType;
+    if (data.currentPhase) state.currentPhase = data.currentPhase;
+    if (data.completedPhases && typeof data.completedPhases === 'object') state.completedPhases = data.completedPhases;
+    if (data.dotdIndex !== undefined) state.dotdIndex = data.dotdIndex;
+    if (data.sessionUID) state.sessionUID = data.sessionUID;
+    if (Array.isArray(data.participants) && data.participants.length) state.participants = data.participants;
+    if (Array.isArray(data.sprintQualifyingFinal)) state.sprintQualifyingFinal = data.sprintQualifyingFinal;
+    if (Array.isArray(data.sprintFinal)) state.sprintFinal = data.sprintFinal;
+    if (Array.isArray(data.qualifyingFinal)) state.qualifyingFinal = data.qualifyingFinal;
+    if (Array.isArray(data.raceFinal)) state.raceFinal = data.raceFinal;
+    if (data.fastestLap) state.fastestLap = data.fastestLap;
+    addEvent(`Loaded autosaved weekend draft from ${data.savedAt || 'previous run'}`);
+  } catch (err) {
+    console.warn('Could not load fantasy-autosave.json:', err.message);
+  }
 }
 
 function upsertSummaryHistory(record) {
@@ -198,6 +252,7 @@ function saveCurrentWeekend(customName) {
   state.selectedHistoryId = record.id;
   upsertSummaryHistory(record);
   saveSavedHistory();
+  saveAutosaveDraft();
   addEvent(`Saved ${record.name} to Race History`);
   return record;
 }
@@ -254,13 +309,36 @@ function normalizeDriverKey(name) {
   return DRIVER_META[up] ? up : '';
 }
 
+function customCodeFromName(name, fallback) {
+  const cleaned = String(name || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned.length >= 3) return cleaned.slice(0, 3);
+  return fallback;
+}
+
 function buildParticipant(index, driverId, teamId, raceNumber, rawName, manual) {
-  let key = manual || DRIVER_BY_ID[driverId] || DRIVER_BY_RACE_NUMBER[raceNumber] || normalizeDriverKey(rawName);
+  const teamFromPacket = TEAM_CODES_BY_ID[teamId] || '';
+  const manualObj = manual && typeof manual === 'object' ? manual : null;
+  const manualKey = manualObj ? manualObj.key : (manual || '');
+  const manualTeam = manualObj && manualObj.team ? manualObj.team : '';
+  const manualName = manualObj && manualObj.name ? manualObj.name : '';
+  const manualCode = manualObj && manualObj.code ? manualObj.code : '';
+
+  let key = manualKey || DRIVER_BY_ID[driverId] || DRIVER_BY_RACE_NUMBER[raceNumber] || normalizeDriverKey(rawName);
   if (!key && normalizeDriverKey(rawName)) key = normalizeDriverKey(rawName);
-  if (!key) return { ...defaultParticipant(index), driverId, teamId, raceNumber, rawName: rawName || '' };
-  const meta = DRIVER_META[key] || { code: key.slice(0,3), fullName: key, team: TEAM_CODES_BY_ID[teamId] || 'CR' };
-  const team = meta.team || TEAM_CODES_BY_ID[teamId] || 'CR';
-  return { index, driverId, teamId, raceNumber, name: key, fullName: meta.fullName || key, code: meta.code || key.slice(0,3), team, teamName: TEAM_META[team]?.name || team, rawName: rawName || '' };
+
+  // Custom career/My Team/player cars often arrive with unknown driver IDs, but the packet can still
+  // contain the correct team ID. Keep them on the correct constructor instead of dumping them into CR.
+  if (!key) {
+    const isPlayer = index === state.playerCarIndex || index === state.secondaryPlayerCarIndex;
+    const team = manualTeam || teamFromPacket || 'CR';
+    const fullName = manualName || (rawName && rawName.length >= 2 ? rawName : (isPlayer ? 'Player Driver' : `Car ${index}`));
+    const code = manualCode || (isPlayer ? 'YOU' : customCodeFromName(fullName, `C${index}`));
+    return { index, driverId, teamId, raceNumber, name: fullName, fullName, code, team, teamName: TEAM_META[team]?.name || team, rawName: rawName || '', custom: true, isPlayer };
+  }
+
+  const meta = DRIVER_META[key] || { code: key.slice(0,3), fullName: key, team: teamFromPacket || 'CR' };
+  const team = manualTeam || meta.team || teamFromPacket || 'CR';
+  return { index, driverId, teamId, raceNumber, name: key, fullName: manualName || meta.fullName || key, code: manualCode || meta.code || key.slice(0,3), team, teamName: TEAM_META[team]?.name || team, rawName: rawName || '', isPlayer: index === state.playerCarIndex || index === state.secondaryPlayerCarIndex };
 }
 
 function parseSession(buf) {
@@ -353,8 +431,8 @@ function parseParticipants(buf, header) {
   for (let i = 0; i < 22; i++) {
     const c = best.candidates[i];
     if (!c) { participants.push(defaultParticipant(i)); continue; }
-    const manual = manualNames[i] || manualNames[String(i)];
-    participants.push(buildParticipant(i, c.driverId, c.teamId, c.raceNumber, c.rawName, manual || c.key));
+    const manual = manualNames[i] || manualNames[String(i)] || (i === state.playerCarIndex ? manualNames.player : null) || (i === state.secondaryPlayerCarIndex ? manualNames.secondaryPlayer : null);
+    participants.push(buildParticipant(i, c.driverId, c.teamId, c.raceNumber, c.rawName, manual || (c.key ? { key: c.key } : null)));
   }
 
   // If the parser still produced lots of repeated placeholder names, keep the previous known good names.
@@ -427,10 +505,21 @@ function parseFinalClassification(buf) {
     return { ...r, overtakes: state.overtakes[r.index] || 0, ...breakdown, fantasy: breakdown.total };
   }).sort((a, b) => a.position - b.position);
   state.final = scored;
-  if (state.session.kind === 'qualifying') state.qualifyingFinal = scored;
-  else if (state.session.kind === 'sprintQualifying') state.sprintQualifyingFinal = scored;
-  else if (state.session.kind === 'sprint') state.sprintFinal = scored;
-  else if (state.session.kind === 'race') state.raceFinal = scored;
+  const phase = scoringKind(state.session.autoKind || state.session.kind);
+  if (['qualifying','sprintQualifying','sprint','race'].includes(phase)) {
+    const locked = recalcScoredRows(scored, phase, { force: true, finalize: true }).map(r => ({
+      ...r,
+      total: Number(r.total ?? r.fantasy ?? 0),
+      fantasy: Number(r.fantasy ?? r.total ?? 0),
+      locked: true,
+      saved: true,
+      sessionKind: phase,
+      savedAt: new Date().toISOString()
+    }));
+    setPhaseRows(phase, locked);
+    state.completedPhases[phase] = true;
+    saveAutosaveDraft(`Auto-saved ${PHASE_LABELS[phase] || phase} final classification before podium/reset.`);
+  }
   addToHistory(scored);
   addEvent(`Final classification received — ${state.session.name} (${state.session.kind}) calculated`);
 }
@@ -508,6 +597,7 @@ function freezePhaseRows(phase, reason = '') {
   }));
   setPhaseRows(phase, locked);
   if (reason) addEvent(reason);
+  saveAutosaveDraft();
   return locked;
 }
 
@@ -550,6 +640,7 @@ function saveCurrentPhaseAndAdvance() {
   const locked = freezePhaseRows(phase);
   if (!locked.length) addEvent(`Nothing to save for ${PHASE_LABELS[phase] || phase} yet.`);
   state.completedPhases[phase] = true;
+  saveAutosaveDraft();
   const flow = currentFlow();
   const i = flow.indexOf(phase);
   if (i >= 0 && i < flow.length - 1) {
@@ -877,7 +968,18 @@ function loadManualNames() {
     if (!fs.existsSync(file)) return {};
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
     const out = {};
-    for (const [k,v] of Object.entries(parsed)) out[k] = normalizeDriverKey(v) || String(v).toUpperCase();
+    for (const [k, v] of Object.entries(parsed)) {
+      if (v && typeof v === 'object') {
+        out[k] = {
+          key: normalizeDriverKey(v.key || v.driver || v.name || '') || '',
+          name: v.name || v.fullName || v.driver || '',
+          code: v.code || '',
+          team: String(v.team || '').toUpperCase()
+        };
+      } else {
+        out[k] = { key: normalizeDriverKey(v) || String(v).toUpperCase(), name: String(v || ''), code: '', team: '' };
+      }
+    }
     return out;
   } catch { return {}; }
 }
@@ -915,7 +1017,7 @@ function snapshot() {
   return {
     ...state,
     teamMeta: TEAM_META,
-    localIps: publicIps(), udpPort: UDP_PORT, webPort: WEB_PORT, round: currentRound(),
+    localIps: publicIps(), udpPort: UDP_PORT, webPort: WEB_PORT, round: currentRound(), playerCarIndex: state.playerCarIndex, secondaryPlayerCarIndex: state.secondaryPlayerCarIndex,
     weekendType: state.weekendType, currentPhase: ensureCurrentPhase(), completedPhases: state.completedPhases, weekendFlow: currentFlow(), phaseLabels: PHASE_LABELS,
     constructors: weekendConstructorsSnapshot(),
     driverRows: weekendDriverRows(),
@@ -946,6 +1048,8 @@ udp.on('message', (buf, rinfo) => {
     return;
   }
   state.connected = true;
+  state.playerCarIndex = header.playerCarIndex;
+  state.secondaryPlayerCarIndex = header.secondaryPlayerCarIndex;
   state.packets++;
   state.lastPacketAt = new Date().toISOString();
   state.lastRemote = `${rinfo.address}:${rinfo.port}`;
@@ -964,6 +1068,7 @@ udp.on('message', (buf, rinfo) => {
     state.fastestLap = null;
     state.final = [];
     state.cars = [];
+    saveAutosaveDraft('Session UID changed; saved draft before clearing live podium/reset data.');
   }
   state.packetCounts[header.packetId] = (state.packetCounts[header.packetId] || 0) + 1;
   if (header.packetFormat !== 2025 && header.packetFormat !== 2026) addEvent(`Warning: unsupported UDP format ${header.packetFormat}`);
@@ -1154,6 +1259,7 @@ const server = http.createServer((req, res) => {
     // DOTD is the only driver-only bonus that may be applied after the race is saved.
     // Keep the saved race result / FL / overtake / position points intact and only swap the DOTD bonus.
     state.raceFinal = applyDotdToRaceRows(state.raceFinal);
+    saveAutosaveDraft();
     addEvent(`Driver of the Day set to ${state.dotdIndex == null ? 'none' : driverDisplay(state.dotdIndex).fullName}`);
     return sendJson(res, snapshot());
   }
