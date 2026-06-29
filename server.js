@@ -123,6 +123,8 @@ const state = {
   sessionUID: null,
   overtakes: Array(22).fill(0),
   driverBestPitstop: Array(22).fill(null),
+  racePitstopSnapshot: Array(22).fill(null),
+  pitStopTracker: Array.from({ length: 22 }, () => ({ active: false, maxMs: 0 })),
   history: { drivers: {}, constructors: {} },
   raceHistory: [],
   selectedHistoryId: null,
@@ -176,7 +178,9 @@ function autosavePayload() {
     sprintFinal: state.sprintFinal,
     qualifyingFinal: state.qualifyingFinal,
     raceFinal: state.raceFinal,
-    fastestLap: state.fastestLap
+    fastestLap: state.fastestLap,
+    driverBestPitstop: state.driverBestPitstop,
+    racePitstopSnapshot: state.racePitstopSnapshot
   };
 }
 
@@ -205,6 +209,8 @@ function loadAutosaveDraft() {
     if (Array.isArray(data.qualifyingFinal)) state.qualifyingFinal = data.qualifyingFinal;
     if (Array.isArray(data.raceFinal)) state.raceFinal = data.raceFinal;
     if (data.fastestLap) state.fastestLap = data.fastestLap;
+    if (Array.isArray(data.driverBestPitstop)) state.driverBestPitstop = data.driverBestPitstop.slice(0, 22).concat(Array(22).fill(null)).slice(0, 22);
+    if (Array.isArray(data.racePitstopSnapshot)) state.racePitstopSnapshot = data.racePitstopSnapshot.slice(0, 22).concat(Array(22).fill(null)).slice(0, 22);
     addEvent(`Loaded autosaved weekend draft from ${data.savedAt || 'previous run'}`);
   } catch (err) {
     console.warn('Could not load fantasy-autosave.json:', err.message);
@@ -241,6 +247,7 @@ function buildWeekendRecord(customName) {
     sessionName: state.session.name,
     dotd,
     fastestLap: state.fastestLap ? { ...state.fastestLap, time: formatMs(state.fastestLap.ms) } : null,
+    pitstops: pitstopTimeSource().map((ms, index) => ms ? { index, driver: driverDisplay(index), ms, time: formatPitMs(ms) } : null).filter(Boolean),
     drivers,
     constructors
   };
@@ -361,7 +368,9 @@ function parseSession(buf) {
     state.cars = [];
     state.fastestLap = null;
     state.overtakes = Array(22).fill(0);
+    if (phase === 'race') snapshotRacePitstops();
     state.driverBestPitstop = Array(22).fill(null);
+    resetPitStopTracker();
     state.lastFinalKey = '';
     addEvent(`Session detected: ${name}. Detected ${detectedKind}; scoring as ${state.session.kind} (${PHASE_LABELS[state.currentPhase] || state.currentPhase})`);
   }
@@ -446,6 +455,64 @@ function parseParticipants(buf, header) {
   addEvent(`Participants updated: ${active} cars, record size ${best.size}, confidence ${best.score}, UDP ${header.packetFormat}`);
 }
 
+
+function resetPitStopTracker() {
+  state.pitStopTracker = Array.from({ length: 22 }, () => ({ active: false, maxMs: 0 }));
+}
+
+function recordCompletedPitstop(index, timeMs, source = 'telemetry') {
+  const ms = Math.round(Number(timeMs || 0));
+  // Ignore impossible/noisy values. Real F1-game stop timers are normally around 1.8s-4.5s.
+  if (!Number.isFinite(ms) || ms < 1000 || ms > 15000) return false;
+  const previous = state.driverBestPitstop[index];
+  if (!previous || ms < previous) {
+    state.driverBestPitstop[index] = ms;
+    const d = driverDisplay(index);
+    addEvent(`Pit stop: ${d.code} ${formatMs(ms)} (${source})`);
+    return true;
+  }
+  return false;
+}
+
+function updatePitstopTracker(index, pitStopTimerMs, pitLaneTimerActive) {
+  const tracker = state.pitStopTracker[index] || { active: false, maxMs: 0 };
+  const ms = Number(pitStopTimerMs || 0);
+  const active = Number(pitLaneTimerActive || 0) === 1;
+
+  if (active) {
+    tracker.active = true;
+    if (ms > tracker.maxMs) tracker.maxMs = ms;
+  } else if (tracker.active) {
+    // Timer has stopped; lock the completed stop using the highest timer value from that pit visit.
+    recordCompletedPitstop(index, tracker.maxMs, 'completed');
+    tracker.active = false;
+    tracker.maxMs = 0;
+  } else if (ms >= 1800 && ms <= 6000) {
+    // Fallback for packet revisions/offsets where the active flag is not reliable.
+    // Use plausible completed-looking values only; do not capture the early 1000ms tick as the stop time.
+    recordCompletedPitstop(index, ms, 'fallback');
+  }
+
+  state.pitStopTracker[index] = tracker;
+}
+
+function snapshotRacePitstops() {
+  if (Array.isArray(state.driverBestPitstop) && state.driverBestPitstop.some(Boolean)) {
+    state.racePitstopSnapshot = state.driverBestPitstop.slice(0, 22);
+  }
+  return state.racePitstopSnapshot || Array(22).fill(null);
+}
+
+function pitstopTimeSource() {
+  const saved = state.racePitstopSnapshot || [];
+  if (saved.some(Boolean)) return saved;
+  return state.driverBestPitstop || [];
+}
+
+function formatPitMs(ms) {
+  return ms ? `${(Number(ms) / 1000).toFixed(3)}s` : '';
+}
+
 function parseLapData(buf) {
   const cars = [];
   let fastest = state.fastestLap;
@@ -460,11 +527,9 @@ function parseLapData(buf) {
     const gridPosition = buf.readUInt8(o + 43);
     const resultStatus = buf.readUInt8(o + 45);
     const pitStopTimerMs = buf.readUInt16LE(o + 49);
+    const pitLaneTimerActive = o + 51 < buf.length ? buf.readUInt8(o + 51) : 0;
     if (lastLap > 0 && (!fastest || lastLap < fastest.ms)) fastest = { vehicleIdx: i, ms: lastLap, name: driverDisplay(i).fullName, code: driverDisplay(i).code };
-    if (pitStopTimerMs >= 1000 && pitStopTimerMs <= 10000) {
-      const previous = state.driverBestPitstop[i];
-      if (!previous || pitStopTimerMs < previous) state.driverBestPitstop[i] = pitStopTimerMs;
-    }
+    updatePitstopTracker(i, pitStopTimerMs, pitLaneTimerActive);
     if (carPosition > 0 && carPosition < 30) {
       const baseRow = { index: i, position: carPosition, grid: gridPosition, penaltiesTime: penalties, resultStatus, bestLapMs: lastLap };
       const breakdown = scoreBreakdown(baseRow, fastest);
@@ -517,6 +582,7 @@ function parseFinalClassification(buf) {
       savedAt: new Date().toISOString()
     }));
     setPhaseRows(phase, locked);
+    if (phase === 'race') snapshotRacePitstops();
     state.completedPhases[phase] = true;
     saveAutosaveDraft(`Auto-saved ${PHASE_LABELS[phase] || phase} final classification before podium/reset.`);
   }
@@ -596,6 +662,7 @@ function freezePhaseRows(phase, reason = '') {
     savedAt: new Date().toISOString()
   }));
   setPhaseRows(phase, locked);
+  if (phase === 'race') snapshotRacePitstops();
   if (reason) addEvent(reason);
   saveAutosaveDraft();
   return locked;
@@ -649,7 +716,9 @@ function saveCurrentPhaseAndAdvance() {
     state.cars = [];
     state.fastestLap = null;
     state.overtakes = Array(22).fill(0);
+    if (phase === 'race') snapshotRacePitstops();
     state.driverBestPitstop = Array(22).fill(null);
+    resetPitStopTracker();
     state.lastFinalKey = '';
     addEvent(`Saved ${PHASE_LABELS[phase] || phase}. Waiting for ${PHASE_LABELS[state.currentPhase] || state.currentPhase}.`);
   } else {
@@ -704,17 +773,39 @@ function driverDisplay(index) {
 }
 
 function constructorPitstopPoints(teamCode) {
-  const drivers = state.participants.filter(p => p.team === teamCode).map(p => p.index);
-  const times = drivers.map(i => state.driverBestPitstop[i]).filter(Boolean);
-  if (!times.length) return { pitstopPoints: 0, bestPitstopMs: null };
+  const source = pitstopTimeSource();
+  const teamDrivers = state.participants.filter(p => p.team === teamCode).map(p => p.index);
+  const times = teamDrivers.map(i => source[i]).filter(Boolean).map(Number);
+  if (!times.length) {
+    return { pitstopPoints: 0, pitstopBasePoints: 0, fastestPitstopBonus: 0, pitstopWorldRecordBonus: 0, bestPitstopMs: null, bestPitstopFormatted: '' };
+  }
+
   const best = Math.min(...times);
-  let pts = 0;
-  if (best < 1800) pts = 35;
-  else if (best < 2000) pts = 20;
-  else if (best <= 2199) pts = 10;
-  else if (best <= 2499) pts = 5;
-  else if (best <= 2999) pts = 2;
-  return { pitstopPoints: pts, bestPitstopMs: best };
+  const allTimes = (source || []).filter(Boolean).map(Number);
+  const overallBest = allTimes.length ? Math.min(...allTimes) : null;
+
+  // Telemetry mode thresholds: F1 25 pit timers are less precise than FIA timing,
+  // so use wider scoring bands while keeping the same fantasy-point idea.
+  let base = 0;
+  if (best < 2400) base = 20;
+  else if (best <= 2599) base = 10;
+  else if (best <= 2899) base = 5;
+  else if (best <= 3299) base = 2;
+  else base = 0;
+
+  const fastestBonus = overallBest != null && best === overallBest ? 5 : 0;
+  // Keep WRB as the strict/original benchmark so it stays special.
+  const worldRecordBonus = best < 1800 ? 15 : 0;
+  const total = base + fastestBonus + worldRecordBonus;
+
+  return {
+    pitstopPoints: total,
+    pitstopBasePoints: base,
+    fastestPitstopBonus: fastestBonus,
+    pitstopWorldRecordBonus: worldRecordBonus,
+    bestPitstopMs: best,
+    bestPitstopFormatted: formatPitMs(best)
+  };
 }
 
 function qualiTeamwork(teamRows) {
@@ -908,7 +999,11 @@ function weekendConstructorsSnapshot() {
   for (const t of map.values()) {
     const pit = constructorPitstopPoints(t.code);
     t.pitstopPoints = pit.pitstopPoints;
+    t.pitstopBasePoints = pit.pitstopBasePoints;
+    t.fastestPitstopBonus = pit.fastestPitstopBonus;
+    t.pitstopWorldRecordBonus = pit.pitstopWorldRecordBonus;
     t.bestPitstopMs = pit.bestPitstopMs;
+    t.bestPitstopFormatted = pit.bestPitstopFormatted;
     t.total += t.pitstopPoints;
   }
   return Array.from(map.values()).sort((a,b)=>b.total-a.total);
@@ -937,7 +1032,11 @@ function constructorsSnapshot() {
     } else {
       const pit = constructorPitstopPoints(t.code);
       t.pitstopPoints = pit.pitstopPoints;
+      t.pitstopBasePoints = pit.pitstopBasePoints;
+      t.fastestPitstopBonus = pit.fastestPitstopBonus;
+      t.pitstopWorldRecordBonus = pit.pitstopWorldRecordBonus;
       t.bestPitstopMs = pit.bestPitstopMs;
+      t.bestPitstopFormatted = pit.bestPitstopFormatted;
       t.total = t.rows.reduce((sum, r) => sum + Number(r.fantasy || 0) - Number(r.dotdBonus || 0), 0) + t.pitstopPoints;
     }
     delete t.rows;
@@ -1063,8 +1162,10 @@ udp.on('message', (buf, rinfo) => {
     if (!state.completedPhases[phase] && hasSessionRows(state.final && state.final.length ? state.final : state.cars)) {
       freezePhaseRows(phase, `Auto-preserved ${PHASE_LABELS[phase] || phase} points before new session UID.`);
     }
+    if (phase === 'race') snapshotRacePitstops();
     state.overtakes = Array(22).fill(0);
     state.driverBestPitstop = Array(22).fill(null);
+    resetPitStopTracker();
     state.fastestLap = null;
     state.final = [];
     state.cars = [];
@@ -1145,6 +1246,14 @@ function makeSimRows(kind, seed = Date.now()) {
   }
   const fastestIndex = order[(Math.abs(seed) % 6)];
   state.overtakes = Array(22).fill(0);
+  if (kind === 'race') {
+    state.driverBestPitstop = Array(22).fill(null);
+    for (const idx of indices) {
+      // Deterministic simulated pit stops from 1.85s to 3.25s so constructor pit scoring can be tested.
+      state.driverBestPitstop[idx] = 1850 + ((seed + idx * 137) % 1400);
+    }
+    state.racePitstopSnapshot = state.driverBestPitstop.slice(0, 22);
+  }
   const rows = order.map((idx, pos0) => {
     const p = state.participants[idx];
     const position = pos0 + 1;
@@ -1219,6 +1328,9 @@ const server = http.createServer((req, res) => {
       state.weekendType = type;
       state.currentPhase = currentFlow()[0];
       state.completedPhases = {};
+      state.racePitstopSnapshot = Array(22).fill(null);
+      state.driverBestPitstop = Array(22).fill(null);
+      resetPitStopTracker();
       state.manualKind = 'auto';
       state.session.autoKind = state.currentPhase;
       state.session.kind = scoringKind(state.session.autoKind);
