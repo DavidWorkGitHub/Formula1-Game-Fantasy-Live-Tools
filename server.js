@@ -3,13 +3,26 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const net = require('net');
 
-const UDP_PORT = Number(process.env.UDP_PORT || 20777);
-const WEB_PORT = Number(process.env.WEB_PORT || 3000);
+const SETTINGS_FILE = path.join(__dirname, 'app-settings.json');
+function loadAppSettings() {
+  try { return fs.existsSync(SETTINGS_FILE) ? JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) : {}; }
+  catch (err) { console.warn('Could not load app-settings.json:', err.message); return {}; }
+}
+function saveAppSettings(settings) { fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2)); }
+const APP_SETTINGS = loadAppSettings();
+function validUdpPort(value) {
+  const port = Number(value);
+  return Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : 20777;
+}
+let UDP_PORT = validUdpPort(process.env.UDP_PORT || APP_SETTINGS.udpPort || 20777);
+const UDP_HOST = process.env.UDP_HOST || '0.0.0.0';
+let WEB_PORT = Number(process.env.WEB_PORT || 3000);
 const HEADER_SIZE = 29;
 const LAP_DATA_SIZE = 57;
 const FINAL_CLASSIFICATION_SIZE = 46;
-const PARTICIPANT_SIZE = 58;
+const PARTICIPANT_SIZE = 57;
 const HISTORY_FILE = path.join(__dirname, 'fantasy-history.json');
 const AUTOSAVE_FILE = path.join(__dirname, 'fantasy-autosave.json');
 
@@ -43,6 +56,44 @@ const WEEKEND_FLOWS = {
 };
 const PHASE_LABELS = { sprintQualifying:'Sprint Qualifying', sprint:'Sprint Race', qualifying:'Race Qualifying', race:'Race' };
 
+
+
+const RACE_CALENDAR = [
+  { round:1, flag:'🇦🇺', name:'Australian Grand Prix', location:'Melbourne' },
+  { round:2, flag:'🇨🇳', name:'Chinese Grand Prix', location:'Shanghai' },
+  { round:3, flag:'🇯🇵', name:'Japanese Grand Prix', location:'Suzuka' },
+  { round:4, flag:'🇧🇭', name:'Bahrain Grand Prix', location:'Sakhir' },
+  { round:5, flag:'🇸🇦', name:'Saudi Arabian Grand Prix', location:'Jeddah' },
+  { round:6, flag:'🇺🇸', name:'Miami Grand Prix', location:'Miami' },
+  { round:7, flag:'🇮🇹', name:'Emilia Romagna Grand Prix', location:'Imola' },
+  { round:8, flag:'🇲🇨', name:'Monaco Grand Prix', location:'Monaco' },
+  { round:9, flag:'🇪🇸', name:'Spanish Grand Prix', location:'Barcelona' },
+  { round:10, flag:'🇨🇦', name:'Canadian Grand Prix', location:'Montreal' },
+  { round:11, flag:'🇦🇹', name:'Austrian Grand Prix', location:'Spielberg' },
+  { round:12, flag:'🇬🇧', name:'British Grand Prix', location:'Silverstone' },
+  { round:13, flag:'🇧🇪', name:'Belgian Grand Prix', location:'Spa-Francorchamps' },
+  { round:14, flag:'🇭🇺', name:'Hungarian Grand Prix', location:'Budapest' },
+  { round:15, flag:'🇳🇱', name:'Dutch Grand Prix', location:'Zandvoort' },
+  { round:16, flag:'🇮🇹', name:'Italian Grand Prix', location:'Monza' },
+  { round:17, flag:'🇦🇿', name:'Azerbaijan Grand Prix', location:'Baku' },
+  { round:18, flag:'🇸🇬', name:'Singapore Grand Prix', location:'Singapore' },
+  { round:19, flag:'🇺🇸', name:'United States Grand Prix', location:'Austin' },
+  { round:20, flag:'🇲🇽', name:'Mexico City Grand Prix', location:'Mexico City' },
+  { round:21, flag:'🇧🇷', name:'São Paulo Grand Prix', location:'Interlagos' },
+  { round:22, flag:'🇺🇸', name:'Las Vegas Grand Prix', location:'Las Vegas' },
+  { round:23, flag:'🇶🇦', name:'Qatar Grand Prix', location:'Lusail' },
+  { round:24, flag:'🇦🇪', name:'Abu Dhabi Grand Prix', location:'Yas Marina' }
+];
+function raceInfo(round) {
+  const r = Number(round || currentRound?.() || 1);
+  return RACE_CALENDAR.find(x => x.round === r) || { round:r, flag:'🏁', name:`Round ${r}`, location:'Unknown' };
+}
+
+// F1 track IDs are not season round numbers. This map keeps the race banner/history on the right round.
+const TRACK_ID_TO_ROUND = {
+  0:1, 2:2, 13:3, 3:4, 29:5, 30:6, 27:7, 5:8, 4:9, 6:10, 17:11, 7:12,
+  10:13, 9:14, 26:15, 11:16, 20:17, 12:18, 15:19, 19:20, 16:21, 31:22, 32:23, 14:24
+};
 
 const TEAM_CODES_BY_ID = {
   0:'MER',1:'FER',2:'RED',3:'WIL',4:'AST',5:'ALP',6:'VRB',7:'HAA',8:'MCL',9:'AUD',
@@ -129,11 +180,18 @@ const state = {
   raceHistory: [],
   selectedHistoryId: null,
   lastFinalKey: '',
+  lastFinalPacketKey: '',
   udpBound: false,
   udpError: null,
   parseErrors: [],
   lastPacketSummary: null,
   packetBytes: 0,
+  rawPackets: 0,
+  rawPacketBytes: 0,
+  lastRawRemote: null,
+  lastRawSize: 0,
+  lastRawAt: null,
+  udpAddress: null,
 };
 const clients = new Set();
 loadSavedHistory();
@@ -330,7 +388,8 @@ function buildParticipant(index, driverId, teamId, raceNumber, rawName, manual) 
   const manualName = manualObj && manualObj.name ? manualObj.name : '';
   const manualCode = manualObj && manualObj.code ? manualObj.code : '';
 
-  let key = manualKey || DRIVER_BY_ID[driverId] || DRIVER_BY_RACE_NUMBER[raceNumber] || normalizeDriverKey(rawName);
+  const networkHuman = Number(driverId) === 255;
+  let key = manualKey || DRIVER_BY_ID[driverId] || (!networkHuman ? DRIVER_BY_RACE_NUMBER[raceNumber] : '') || normalizeDriverKey(rawName);
   if (!key && normalizeDriverKey(rawName)) key = normalizeDriverKey(rawName);
 
   // Custom career/My Team/player cars often arrive with unknown driver IDs, but the packet can still
@@ -355,104 +414,90 @@ function parseSession(buf) {
   const trackId = buf.readInt8(HEADER_SIZE + 7);
   const name = SESSION_TYPES[sessionType] || `Session ${sessionType}`;
   const detectedKind = SPRINT_QUALIFYING_SESSION_IDS.has(sessionType) ? 'sprintQualifying' : RACE_QUALIFYING_SESSION_IDS.has(sessionType) ? 'qualifying' : RACE_SESSION_IDS.has(sessionType) ? 'race' : 'practice';
-  const autoKind = resolveAutoKind(detectedKind);
+
+  // Auto-detect the weekend shape from the first competitive session.
+  // This prevents a normal qualifying session being treated as non-scoring Sprint Qualifying.
+  const noSavedPhases = Object.keys(state.completedPhases || {}).length === 0 && !(state.sprintFinal || []).length && !(state.qualifyingFinal || []).length && !(state.raceFinal || []).length;
+  if (noSavedPhases && detectedKind === 'sprintQualifying') {
+    state.weekendType = 'sprint';
+    state.currentPhase = 'sprintQualifying';
+  } else if (noSavedPhases && detectedKind === 'qualifying' && state.currentPhase === 'sprintQualifying') {
+    state.weekendType = 'standard';
+    state.currentPhase = 'qualifying';
+  } else if (noSavedPhases && detectedKind === 'race' && state.currentPhase === 'sprintQualifying') {
+    state.weekendType = 'standard';
+    state.currentPhase = 'race';
+  }
+
+  const previousLogicalKind = state.session.autoKind || state.session.detectedKind || 'unknown';
   const previousType = state.session.type;
-  const previousUid = state.sessionUID;
+  const autoKind = resolveAutoKind(detectedKind);
   state.session = { type: sessionType, name, detectedKind, autoKind, kind: scoringKind(autoKind), totalLaps, trackId };
-  if (previousType !== sessionType || previousUid !== state.sessionUID) {
-    const phase = ensureCurrentPhase();
-    if (!state.completedPhases[phase] && hasSessionRows(state.final && state.final.length ? state.final : state.cars)) {
-      freezePhaseRows(phase, `Auto-preserved ${PHASE_LABELS[phase] || phase} points before session changed.`);
+
+  // Q1 -> Q2 -> Q3 are the same fantasy phase. Do not wipe scores or fastest laps between them.
+  const logicalChanged = previousLogicalKind !== 'unknown' && autoKind !== previousLogicalKind;
+  if (logicalChanged) {
+    const previousPhase = currentFlow().includes(previousLogicalKind) ? previousLogicalKind : ensureCurrentPhase();
+    if (!state.completedPhases[previousPhase] && hasSessionRows(state.final?.length ? state.final : state.cars)) {
+      freezePhaseRows(previousPhase, `Auto-preserved ${PHASE_LABELS[previousPhase] || previousPhase} points before session changed.`);
     }
-    state.final = [];
-    state.cars = [];
-    state.fastestLap = null;
-    state.overtakes = Array(22).fill(0);
-    if (phase === 'race') snapshotRacePitstops();
-    state.driverBestPitstop = Array(22).fill(null);
-    resetPitStopTracker();
-    state.lastFinalKey = '';
+    clearLiveSessionState(previousPhase === 'race');
+  }
+  if (previousType !== sessionType || logicalChanged) {
     addEvent(`Session detected: ${name}. Detected ${detectedKind}; scoring as ${state.session.kind} (${PHASE_LABELS[state.currentPhase] || state.currentPhase})`);
   }
 }
 
-function readParticipantCandidate(buf, o, recordSize) {
-  if (o + 7 > buf.length) return null;
-  const driverId = buf.readUInt8(o + 1);
-  const teamId = buf.readUInt8(o + 3);
-  const raceNumber = buf.readUInt8(o + 5);
-  let bestName = '';
-  let bestKey = '';
-  // F1 2025/2026 participant packets can be 57/58 bytes depending on revision.
-  // The name is normally after nationality at offset 7 and can be 48 bytes.
-  // Older examples used 32 bytes, which caused broken repeated names like SAI/Car.
-  for (const start of [7, 8, 6, 9, 10, 5]) {
-    for (const len of [48, 32, 40]) {
-      if (o + start + len <= buf.length && o + start + len <= o + recordSize + 2) {
-        const candidate = cleanText(buf.subarray(o + start, o + start + len));
-        const key = normalizeDriverKey(candidate);
-        if (key) return { driverId, teamId, raceNumber, rawName: candidate, key };
-        if (candidate.length > bestName.length && /^[A-ZÀ-ž .'-]{3,}$/.test(candidate)) bestName = candidate;
-      }
-    }
-  }
-  return { driverId, teamId, raceNumber, rawName: bestName, key: '' };
-}
 
-function candidateScore(candidates) {
-  let score = 0;
-  const seen = new Set();
-  for (const c of candidates) {
-    if (!c) continue;
-    const key = c.key || DRIVER_BY_ID[c.driverId] || DRIVER_BY_RACE_NUMBER[c.raceNumber] || normalizeDriverKey(c.rawName);
-    if (key && !seen.has(key)) { score += 10; seen.add(key); }
-    else if (key) score -= 8;
-    if (DRIVER_BY_RACE_NUMBER[c.raceNumber]) score += 4;
-    if (DRIVER_BY_ID[c.driverId]) score += 3;
-    if (TEAM_CODES_BY_ID[c.teamId]) score += 2;
-    if (c.rawName && c.rawName.length >= 3) score += 1;
-  }
-  return score;
+function readParticipantRecord(buf, offset, recordSize = PARTICIPANT_SIZE) {
+  if (offset + recordSize > buf.length || recordSize < 39) return null;
+  const aiControlled = buf.readUInt8(offset);
+  const driverId = buf.readUInt8(offset + 1);
+  const networkId = buf.readUInt8(offset + 2);
+  const teamId = buf.readUInt8(offset + 3);
+  const myTeam = buf.readUInt8(offset + 4);
+  const raceNumber = buf.readUInt8(offset + 5);
+  const nationality = buf.readUInt8(offset + 6);
+  const rawName = cleanText(buf.subarray(offset + 7, offset + 39)); // official F1 25 name[32]
+  return { aiControlled, driverId, networkId, teamId, myTeam, raceNumber, nationality, rawName };
 }
 
 function parseParticipants(buf, header) {
+  if (buf.length < HEADER_SIZE + 1) return;
   const active = Math.min(buf.readUInt8(HEADER_SIZE), 22);
   const base = HEADER_SIZE + 1;
-  const manualNames = loadManualNames();
   const remaining = buf.length - base;
-  const possibleSizes = Array.from(new Set([
-    Math.floor(remaining / 22), 58, 57, 56, 60, PARTICIPANT_SIZE
-  ].filter(n => n >= 50 && n <= 70)));
-
-  let best = { score: -Infinity, size: PARTICIPANT_SIZE, candidates: [] };
-  for (const size of possibleSizes) {
-    const candidates = [];
-    for (let i = 0; i < 22; i++) {
-      const o = base + i * size;
-      if (o + 7 > buf.length) break;
-      candidates.push(readParticipantCandidate(buf, o, size));
-    }
-    const score = candidateScore(candidates);
-    if (score > best.score) best = { score, size, candidates };
-  }
-
+  const inferred = Math.floor(remaining / 22);
+  // F1 25 format 2025 is exactly 57 bytes per participant. Keep a conservative fallback for later revisions.
+  const recordSize = inferred >= 57 && inferred <= 70 ? inferred : PARTICIPANT_SIZE;
+  const manualNames = loadManualNames();
   const participants = [];
+
   for (let i = 0; i < 22; i++) {
-    const c = best.candidates[i];
-    if (!c) { participants.push(defaultParticipant(i)); continue; }
+    const rec = readParticipantRecord(buf, base + i * recordSize, recordSize);
+    if (!rec) { participants.push(state.participants[i] || defaultParticipant(i)); continue; }
     const manual = manualNames[i] || manualNames[String(i)] || (i === state.playerCarIndex ? manualNames.player : null) || (i === state.secondaryPlayerCarIndex ? manualNames.secondaryPlayer : null);
-    participants.push(buildParticipant(i, c.driverId, c.teamId, c.raceNumber, c.rawName, manual || (c.key ? { key: c.key } : null)));
+    let contextualManual = manual && typeof manual === 'object' ? { ...manual } : (manual ? { key: manual } : {});
+    // In the 2026 season pack Cadillac may use the old custom-team ID. Only treat it as Cadillac
+    // when it is not a My Team entry; genuine My Team cars remain CR unless manually overridden.
+    if (!contextualManual?.team && rec.teamId === 104 && rec.myTeam === 0) {
+      const key = DRIVER_BY_ID[rec.driverId] || DRIVER_BY_RACE_NUMBER[rec.raceNumber] || normalizeDriverKey(rec.rawName);
+      const isPlayer = i === state.playerCarIndex || i === state.secondaryPlayerCarIndex;
+      if (key === 'PEREZ' || key === 'BOTTAS' || key === 'MARTI' || isPlayer) contextualManual.team = 'CAD';
+    }
+    participants.push(buildParticipant(i, rec.driverId, rec.teamId, rec.raceNumber, rec.rawName, contextualManual));
   }
 
-  // If the parser still produced lots of repeated placeholder names, keep the previous known good names.
-  const uniqueCodes = new Set(participants.map(p => p.code).filter(c => !/^C\d+$/i.test(c)));
-  if (uniqueCodes.size < 10 && new Set(state.participants.map(p => p.code).filter(c => !/^C\d+$/i.test(c))).size >= 10) {
+  const validCodes = participants.map(p => p.code).filter(c => c && !/^C\d+$/i.test(c));
+  const uniqueCodes = new Set(validCodes);
+  const previousUnique = new Set(state.participants.map(p => p.code).filter(c => c && !/^C\d+$/i.test(c)));
+  if (active >= 10 && uniqueCodes.size < Math.min(8, active) && previousUnique.size >= 10) {
     addEvent(`Participants packet ignored: low confidence (${uniqueCodes.size} unique driver codes)`);
     return;
   }
 
-  state.participants = participants.concat(state.participants.slice(participants.length));
-  addEvent(`Participants updated: ${active} cars, record size ${best.size}, confidence ${best.score}, UDP ${header.packetFormat}`);
+  state.participants = participants;
+  addEvent(`Participants updated: ${active} cars, record size ${recordSize}, UDP ${header.packetFormat}`);
 }
 
 
@@ -527,7 +572,7 @@ function parseLapData(buf) {
     const gridPosition = buf.readUInt8(o + 43);
     const resultStatus = buf.readUInt8(o + 45);
     const pitStopTimerMs = buf.readUInt16LE(o + 49);
-    const pitLaneTimerActive = o + 51 < buf.length ? buf.readUInt8(o + 51) : 0;
+    const pitLaneTimerActive = o + 46 < buf.length ? buf.readUInt8(o + 46) : 0;
     if (lastLap > 0 && (!fastest || lastLap < fastest.ms)) fastest = { vehicleIdx: i, ms: lastLap, name: driverDisplay(i).fullName, code: driverDisplay(i).code };
     updatePitstopTracker(i, pitStopTimerMs, pitLaneTimerActive);
     if (carPosition > 0 && carPosition < 30) {
@@ -564,6 +609,9 @@ function parseFinalClassification(buf) {
     if (row.bestLapMs > 0 && (!best || row.bestLapMs < best.ms)) best = { vehicleIdx: i, ms: row.bestLapMs, name: d.fullName, code: d.code };
     rows.push(row);
   }
+  const packetFingerprint = `${state.sessionUID}:${state.session.type}:${rows.map(r => `${r.index}:${r.position}:${r.grid}:${r.resultStatus}:${r.bestLapMs}`).join('|')}`;
+  if (packetFingerprint === state.lastFinalPacketKey) return;
+  state.lastFinalPacketKey = packetFingerprint;
   state.fastestLap = best || state.fastestLap;
   const scored = rows.map(r => {
     const breakdown = scoreBreakdown(r, state.fastestLap);
@@ -581,13 +629,15 @@ function parseFinalClassification(buf) {
       sessionKind: phase,
       savedAt: new Date().toISOString()
     }));
+    const alreadyCompleted = state.completedPhases[phase] === true;
     setPhaseRows(phase, locked);
     if (phase === 'race') snapshotRacePitstops();
     state.completedPhases[phase] = true;
+    if (!alreadyCompleted) advanceAfterFinal(phase);
     saveAutosaveDraft(`Auto-saved ${PHASE_LABELS[phase] || phase} final classification before podium/reset.`);
   }
   addToHistory(scored);
-  addEvent(`Final classification received — ${state.session.name} (${state.session.kind}) calculated`);
+  addEvent(`Final classification received — ${state.session.name} (${phase}) calculated`);
 }
 
 function parseEvent(buf) {
@@ -611,7 +661,9 @@ function parseEvent(buf) {
     addEvent(`Penalty: ${driverDisplay(buf.readUInt8(detail + 2)).code} +${buf.readUInt8(detail + 4)}s`);
   } else if (code === 'RCWN' && buf.length >= detail + 1) {
     addEvent(`Race winner: ${driverDisplay(buf.readUInt8(detail)).fullName}`);
-  } else if (!['SSTA','SEND'].includes(code)) {
+  } else if (code === 'CHQF') {
+    addEvent('Chequered flag');
+  } else if (!['SSTA','SEND','BUTN','LGOT','DRSE','DRSD'].includes(code)) {
     addEvent(`Event: ${code}`);
   }
 }
@@ -666,6 +718,31 @@ function freezePhaseRows(phase, reason = '') {
   if (reason) addEvent(reason);
   saveAutosaveDraft();
   return locked;
+}
+
+function clearLiveSessionState(savePitstops = false) {
+  if (savePitstops) snapshotRacePitstops();
+  state.final = [];
+  state.cars = [];
+  state.carsByIndex = {};
+  state.fastestLap = null;
+  state.overtakes = Array(22).fill(0);
+  state.driverBestPitstop = Array(22).fill(null);
+  resetPitStopTracker();
+  state.lastFinalKey = '';
+  state.lastFinalPacketKey = '';
+}
+
+function advanceAfterFinal(phase) {
+  const flow = currentFlow();
+  const index = flow.indexOf(phase);
+  if (index < 0 || index >= flow.length - 1) return false;
+  const next = flow[index + 1];
+  state.currentPhase = next;
+  // Keep session.autoKind on the completed session until the next Session packet arrives.
+  // This lets the next session transition clear old live rows without mis-saving them as the new phase.
+  addEvent(`Saved ${PHASE_LABELS[phase] || phase}. Waiting for ${PHASE_LABELS[next] || next}.`);
+  return true;
 }
 
 function currentFlow() {
@@ -740,10 +817,12 @@ function scoreBreakdown(row, fastest, kindOverride = null) {
   const overtakes = (row.locked || row.saved) ? Number(row.overtakes || 0) : Number(state.overtakes[row.index] || row.overtakes || 0);
   const isFastest = fastest && fastest.vehicleIdx === row.index;
   const dotdBonus = kind === 'race' && state.dotdIndex === row.index ? 10 : 0;
-  if (kind === 'qualifying' || kind === 'sprintQualifying') {
-    // Qualifying -5 should only be applied once the session has a final/locked result.
-    // During live telemetry many cars briefly report bestLapMs = 0 while the table is still updating;
-    // treating that as No Time caused the -5 bug to come back after refreshes.
+  if (kind === 'sprintQualifying') {
+    // Sprint Qualifying sets the Sprint grid only. It awards no fantasy points or -5 penalty.
+    return { resultPoints: 0, positionGainLoss: 0, overtakes: 0, fastestLapBonus: 0, dotdBonus: 0, badPenalty: 0, penaltySeconds: 0, total: 0 };
+  }
+  if (kind === 'qualifying') {
+    // The -5 applies only once race qualifying is final/locked and the driver has no time/NC/DSQ.
     const badStatus = isBadResult(row.resultStatus);
     const finalOrLocked = row.isFinalClassification === true || row.locked === true || row.saved === true || row.isScoringFinal === true;
     const noTime = finalOrLocked && !row.bestLapMs;
@@ -812,7 +891,7 @@ function qualiTeamwork(teamRows) {
   const good = teamRows.filter(r => !isBadResult(r.resultStatus));
   const q3 = good.filter(r => r.position && r.position <= 10).length;
   const q2 = good.filter(r => r.position && r.position <= 15).length;
-  const dsq = teamRows.filter(r => isBadResult(r.resultStatus)).length;
+  const dsq = teamRows.filter(r => Number(r.resultStatus) === 5).length;
   let teamwork = -1;
   if (q3 >= 2) teamwork = 10;
   else if (q3 === 1) teamwork = 5;
@@ -899,10 +978,11 @@ function weekendDriverRows() {
     const lr = live.get(idx);
     const base = rr || sr || sqr || qr || lr || { index: idx };
     const qTotal = qr ? Number(qr.fantasy || 0) : 0;
-    const sprintQualifyingTotal = sqr ? Number(sqr.fantasy || 0) : 0;
+    // Sprint Qualifying is used only to seed the Sprint; it does not award fantasy points in this app.
+    const sprintQualifyingTotal = 0;
     const sprintTotal = sr ? Number(sr.fantasy || 0) : 0;
     const raceTotal = rr ? Number(rr.fantasy || 0) : 0;
-    const total = qTotal + sprintQualifyingTotal + sprintTotal + raceTotal;
+    const total = qTotal + sprintTotal + raceTotal;
     rows.push({
       ...d,
       index: idx,
@@ -913,8 +993,8 @@ function weekendDriverRows() {
       qPoints: qr ? Number(qr.resultPoints || 0) : 0,
       qPenalty: qr ? Number(qr.badPenalty || 0) : 0,
       sprintQualifyingPosition: sqr?.position || null,
-      sprintQualifyingPoints: sqr ? Number(sqr.resultPoints || 0) : 0,
-      sprintQualifyingPenalty: sqr ? Number(sqr.badPenalty || 0) : 0,
+      sprintQualifyingPoints: 0,
+      sprintQualifyingPenalty: 0,
       sprintPosition: sr?.position || null,
       sprintPoints: sr ? Number(sr.resultPoints || 0) : 0,
       racePosition: rr?.position || null,
@@ -931,9 +1011,9 @@ function weekendDriverRows() {
       dotdBonus: rr ? Number(rr.dotdBonus || 0) : 0,
       raceBadPenalty: rr ? Number(rr.badPenalty || 0) : 0,
       sprintBadPenalty: sr ? Number(sr.badPenalty || 0) : 0,
-      sprintQualifyingBadPenalty: sqr ? Number(sqr.badPenalty || 0) : 0,
+      sprintQualifyingBadPenalty: 0,
       qBadPenalty: qr ? Number(qr.badPenalty || 0) : 0,
-      badPenalty: (rr ? Number(rr.badPenalty || 0) : 0) + (sr ? Number(sr.badPenalty || 0) : 0) + (sqr ? Number(sqr.badPenalty || 0) : 0) + (qr ? Number(qr.badPenalty || 0) : 0),
+      badPenalty: (rr ? Number(rr.badPenalty || 0) : 0) + (sr ? Number(sr.badPenalty || 0) : 0) + (qr ? Number(qr.badPenalty || 0) : 0),
       qTotal,
       sprintQualifyingTotal,
       sprintTotal,
@@ -958,7 +1038,7 @@ function weekendConstructorsSnapshot() {
     t.drivers++;
     t.total += Number(d.total || 0) - Number(d.dotdBonus || 0); // DOTD is driver-only
     t.qualiPos += Number(d.qPoints || 0) + Number(d.qPenalty || 0);
-    t.sprintQualiPos += Number(d.sprintQualifyingPoints || 0) + Number(d.sprintQualifyingPenalty || 0);
+    t.sprintQualiPos += 0; // Sprint Qualifying does not score points
     t.sprintResult += Number(d.sprintPoints || 0);
     t.sprintTotal += Number(d.sprintTotal || 0);
     t.raceResult += Number(d.resultPoints || 0);
@@ -984,18 +1064,7 @@ function weekendConstructorsSnapshot() {
     map.get(code).qualiTeamwork = tw;
     map.get(code).total += tw;
   }
-  const sqByTeam = new Map();
-  for (const r of recalcScoredRows(state.sprintQualifyingFinal || [], 'sprintQualifying')) {
-    const d = driverDisplay(r.index);
-    if (!sqByTeam.has(d.team)) sqByTeam.set(d.team, []);
-    sqByTeam.get(d.team).push({ ...r, team: d.team });
-  }
-  for (const [code, rows] of sqByTeam.entries()) {
-    if (!map.has(code)) map.set(code, { code, name: TEAM_META[code]?.name || code, color: TEAM_META[code]?.color || '#777', total: 0, qualiPos: 0, qualiTeamwork: 0, sprintQualiPos: 0, sprintQualiTeamwork: 0, sprintResult: 0, sprintTotal: 0, raceResult: 0, positionGainLoss: 0, overtakes: 0, fastestLapBonus: 0, pitstopPoints: 0, drivers: 0 });
-    const tw = qualiTeamwork(rows);
-    map.get(code).sprintQualiTeamwork = tw;
-    map.get(code).total += tw;
-  }
+  // Sprint Qualifying is non-scoring, so no constructor points/teamwork are added for it.
   for (const t of map.values()) {
     const pit = constructorPitstopPoints(t.code);
     t.pitstopPoints = pit.pitstopPoints;
@@ -1097,14 +1166,26 @@ function addEvent(text) {
 }
 
 function publicIps() {
-  const nets = os.networkInterfaces();
-  const ips = [];
-  for (const entries of Object.values(nets)) for (const net of entries || []) if (net.family === 'IPv4' && !net.internal) ips.push(net.address);
-  return ips;
+  const candidates = [];
+  for (const [name, entries] of Object.entries(os.networkInterfaces())) {
+    for (const net of entries || []) {
+      if (net.family !== 'IPv4' || net.internal || net.address.startsWith('169.254.')) continue;
+      const address = net.address;
+      let score = 50;
+      if (/wi-?fi|wireless|ethernet/i.test(name)) score -= 20;
+      if (address.startsWith('192.168.')) score -= 20;
+      else if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) score -= 10;
+      else if (address.startsWith('10.')) score -= 5;
+      if (/vpn|virtual|hyper-v|vmware|vbox|loopback|tunnel/i.test(name)) score += 40;
+      candidates.push({ address, score });
+    }
+  }
+  return [...new Map(candidates.sort((a,b)=>a.score-b.score).map(x=>[x.address,x])).values()].map(x=>x.address);
 }
 
 function currentRound() {
-  return state.session.trackId != null ? Math.max(1, Math.min(24, Number(state.session.trackId) + 1)) : 1;
+  const trackId = Number(state.session.trackId);
+  return Number.isInteger(trackId) && TRACK_ID_TO_ROUND[trackId] ? TRACK_ID_TO_ROUND[trackId] : 1;
 }
 
 function allDriversForControls() {
@@ -1116,7 +1197,7 @@ function snapshot() {
   return {
     ...state,
     teamMeta: TEAM_META,
-    localIps: publicIps(), udpPort: UDP_PORT, webPort: WEB_PORT, round: currentRound(), playerCarIndex: state.playerCarIndex, secondaryPlayerCarIndex: state.secondaryPlayerCarIndex,
+    localIps: publicIps(), udpPort: UDP_PORT, udpHost: UDP_HOST, webPort: WEB_PORT, round: currentRound(), raceInfo: raceInfo(currentRound()), nextRace: raceInfo(Math.min(24, currentRound()+1)), playerCarIndex: state.playerCarIndex, secondaryPlayerCarIndex: state.secondaryPlayerCarIndex,
     weekendType: state.weekendType, currentPhase: ensureCurrentPhase(), completedPhases: state.completedPhases, weekendFlow: currentFlow(), phaseLabels: PHASE_LABELS,
     constructors: weekendConstructorsSnapshot(),
     driverRows: weekendDriverRows(),
@@ -1132,68 +1213,133 @@ function broadcast() {
   for (const res of clients) res.write(payload);
 }
 
-const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-udp.on('error', (err) => {
-  state.udpError = err.message;
-  addEvent(`UDP listener error: ${err.message}`);
-  console.error('UDP listener error:', err);
-});
+let udp = null;
 
-udp.on('message', (buf, rinfo) => {
+function recordParseError(text) {
+  state.parseErrors.unshift({ at: new Date().toLocaleTimeString(), text });
+  state.parseErrors = state.parseErrors.slice(0, 20);
+}
+
+function handleUdpMessage(buf, rinfo) {
+  // Count every datagram before parsing so delivery and parser failures are clearly separated.
+  state.rawPackets += 1;
+  state.rawPacketBytes += buf.length;
+  state.lastRawRemote = `${rinfo.address}:${rinfo.port}`;
+  state.lastRawSize = buf.length;
+  state.lastRawAt = new Date().toISOString();
+  if (state.rawPackets <= 10 || state.rawPackets % 250 === 0) {
+    console.log(`[RAW UDP] #${state.rawPackets} ${buf.length} bytes from ${state.lastRawRemote}`);
+  }
+
   const header = readHeader(buf);
   if (!header) {
-    state.parseErrors.unshift({ at: new Date().toLocaleTimeString(), text: `Short/invalid packet: ${buf.length} bytes from ${rinfo.address}:${rinfo.port}` });
-    state.parseErrors = state.parseErrors.slice(0, 20);
+    recordParseError(`Short/invalid packet: ${buf.length} bytes from ${rinfo.address}:${rinfo.port}`);
+    broadcast();
     return;
   }
+
+  const previousUid = state.sessionUID;
+  const hadLivePackets = state.packets > 0;
   state.connected = true;
   state.playerCarIndex = header.playerCarIndex;
   state.secondaryPlayerCarIndex = header.secondaryPlayerCarIndex;
-  state.packets++;
+  state.packets += 1;
   state.lastPacketAt = new Date().toISOString();
   state.lastRemote = `${rinfo.address}:${rinfo.port}`;
   state.packetBytes += buf.length;
   state.lastPacketSummary = { id: header.packetId, name: PACKET[header.packetId] || `Packet ${header.packetId}`, format: header.packetFormat, year: header.gameYear, version: header.packetVersion, bytes: buf.length, from: state.lastRemote, at: state.lastPacketAt };
-  if (state.packets === 1 || state.packets % 250 === 0) console.log(`UDP ${state.packets}: ${state.lastPacketSummary.name} (${buf.length} bytes) from ${state.lastRemote}`);
-  const oldUid = state.sessionUID;
+  state.packetCounts[header.packetId] = (state.packetCounts[header.packetId] || 0) + 1;
   state.sessionUID = header.sessionUID;
-  if (oldUid && oldUid !== header.sessionUID) {
-    const phase = ensureCurrentPhase();
-    if (!state.completedPhases[phase] && hasSessionRows(state.final && state.final.length ? state.final : state.cars)) {
+
+  if (state.packets === 1 || state.packets % 250 === 0) {
+    console.log(`UDP ${state.packets}: ${state.lastPacketSummary.name} (${buf.length} bytes) from ${state.lastRemote}`);
+  }
+
+  // Ignore the pre-race UID=0 button packets and do not let a stale autosave wipe a fresh session.
+  if (hadLivePackets && previousUid && previousUid !== '0' && header.sessionUID !== '0' && previousUid !== header.sessionUID) {
+    const phase = state.session.autoKind && currentFlow().includes(state.session.autoKind) ? state.session.autoKind : ensureCurrentPhase();
+    if (!state.completedPhases[phase] && hasSessionRows(state.final?.length ? state.final : state.cars)) {
       freezePhaseRows(phase, `Auto-preserved ${PHASE_LABELS[phase] || phase} points before new session UID.`);
     }
-    if (phase === 'race') snapshotRacePitstops();
-    state.overtakes = Array(22).fill(0);
-    state.driverBestPitstop = Array(22).fill(null);
-    resetPitStopTracker();
-    state.fastestLap = null;
-    state.final = [];
-    state.cars = [];
+    clearLiveSessionState(phase === 'race');
     saveAutosaveDraft('Session UID changed; saved draft before clearing live podium/reset data.');
   }
-  state.packetCounts[header.packetId] = (state.packetCounts[header.packetId] || 0) + 1;
-  if (header.packetFormat !== 2025 && header.packetFormat !== 2026) addEvent(`Warning: unsupported UDP format ${header.packetFormat}`);
+
+  if (header.packetFormat !== 2025 && header.packetFormat !== 2026) {
+    recordParseError(`Unsupported UDP format ${header.packetFormat}. Use 2025 for the stable parser.`);
+  }
+
   try {
     if (header.packetId === 1) parseSession(buf);
     else if (header.packetId === 2) parseLapData(buf);
     else if (header.packetId === 3) parseEvent(buf);
     else if (header.packetId === 4) parseParticipants(buf, header);
     else if (header.packetId === 8) parseFinalClassification(buf);
-    if (state.packets % 5 === 0) broadcast();
   } catch (err) {
     const text = `Parse error on ${PACKET[header.packetId] || header.packetId}: ${err.message} (${buf.length} bytes)`;
-    state.parseErrors.unshift({ at: new Date().toLocaleTimeString(), text });
-    state.parseErrors = state.parseErrors.slice(0, 20);
+    recordParseError(text);
     addEvent(text);
     console.error(text);
   }
-});
-udp.bind(UDP_PORT, '0.0.0.0', () => {
-  state.udpBound = true;
-  console.log(`F1 25 UDP listener ready on 0.0.0.0:${UDP_PORT}`);
-  console.log(`Dashboard: http://localhost:${WEB_PORT}`);
-  console.log(`Use one of these IPs in F1 25 UDP IP Address: ${publicIps().join(', ') || '127.0.0.1'}`);
-});
+
+  if (state.packets % 5 === 0 || [1,3,4,8].includes(header.packetId)) broadcast();
+}
+
+function closeUdpListener() {
+  return new Promise(resolve => {
+    if (!udp) return resolve();
+    const socket = udp;
+    udp = null;
+    try { socket.close(() => resolve()); }
+    catch { resolve(); }
+  });
+}
+
+async function startUdpListener(port = UDP_PORT, host = UDP_HOST) {
+  const nextPort = validUdpPort(port);
+  await closeUdpListener();
+  state.udpBound = false;
+  state.udpError = null;
+  state.udpAddress = null;
+
+  return new Promise((resolve, reject) => {
+    // Deliberately do not use reuseAddr. Sharing the port with an old Node/app process can make
+    // Windows deliver PS5 packets to the wrong process while local tests appear to work.
+    const socket = dgram.createSocket('udp4');
+    udp = socket;
+    let settled = false;
+
+    socket.on('error', err => {
+      state.udpError = err.message;
+      state.udpBound = false;
+      addEvent(`UDP listener error: ${err.message}`);
+      console.error('UDP listener error:', err);
+      if (!settled) { settled = true; reject(err); }
+      broadcast();
+    });
+    socket.on('message', handleUdpMessage);
+    socket.on('close', () => {
+      if (udp === socket) {
+        state.udpBound = false;
+        state.udpAddress = null;
+      }
+    });
+    socket.bind(nextPort, host, () => {
+      if (udp !== socket) return;
+      UDP_PORT = nextPort;
+      state.udpBound = true;
+      const address = socket.address();
+      state.udpAddress = `${address.address}:${address.port}`;
+      console.log(`F1 25 UDP listener ready on ${state.udpAddress}`);
+      console.log(`Use PC IP ${publicIps().join(', ') || '127.0.0.1'} and UDP port ${UDP_PORT} on PS5.`);
+      if (!settled) { settled = true; resolve(address); }
+      broadcast();
+    });
+  });
+}
+
+startUdpListener(UDP_PORT, UDP_HOST).catch(() => {});
+
 
 
 const SIM_LINEUP = [
@@ -1319,9 +1465,75 @@ function sendJson(res, payload) {
   res.end(JSON.stringify(payload));
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${WEB_PORT}`);
   if (url.pathname === '/api/state' || url.pathname === '/api/debug') return sendJson(res, snapshot());
+  if (url.pathname === '/api/settings/udp-port') {
+    const requested = Number(url.searchParams.get('port'));
+    if (!Number.isInteger(requested) || requested < 1024 || requested > 65535) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ ok:false, error:'UDP port must be a whole number between 1024 and 65535.' }));
+    }
+    const previousPort = UDP_PORT;
+    try {
+      await startUdpListener(requested, UDP_HOST);
+      const settings = loadAppSettings();
+      settings.udpPort = requested;
+      saveAppSettings(settings);
+      addEvent(`UDP listener changed to port ${requested}. Set the PS5 to the same port.`);
+      return sendJson(res, { ok:true, udpPort:requested, restartRequired:false, state:snapshot() });
+    } catch (err) {
+      // Restore the last working listener if the requested port is unavailable.
+      startUdpListener(previousPort, UDP_HOST).catch(() => {});
+      res.writeHead(500, { 'Content-Type':'application/json' });
+      return res.end(JSON.stringify({ ok:false, error:`Could not listen on UDP ${requested}: ${err.message}` }));
+    }
+  }
+  if (url.pathname === '/api/udp-self-test') {
+    const client = dgram.createSocket('udp4');
+    const test = Buffer.alloc(45);
+    test.writeUInt16LE(2025, 0); test.writeUInt8(25, 2); test.writeUInt8(1, 3); test.writeUInt8(0, 4);
+    test.writeUInt8(1, 5); test.writeUInt8(3, 6); test.writeBigUInt64LE(1n, 7);
+    test.writeUInt8(0, 27); test.writeUInt8(255, 28); Buffer.from('BUTN').copy(test, 29);
+    client.send(test, UDP_PORT, '127.0.0.1', err => client.close());
+    return sendJson(res, { ok:true, sentTo:`127.0.0.1:${UDP_PORT}`, state:snapshot() });
+  }
+  if (url.pathname === '/api/storage/delete-all') {
+    try {
+      for (const file of [HISTORY_FILE, AUTOSAVE_FILE]) {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      }
+      state.history = { drivers:{}, constructors:{} };
+      state.raceHistory = [];
+      state.selectedHistoryId = null;
+      state.completedPhases = {};
+      state.dotdIndex = null;
+      state.final = [];
+      state.cars = [];
+      state.qualifyingFinal = [];
+      state.sprintQualifyingFinal = [];
+      state.sprintFinal = [];
+      state.raceFinal = [];
+      state.fastestLap = null;
+      state.overtakes = Array(22).fill(0);
+      state.driverBestPitstop = Array(22).fill(null);
+      state.racePitstopSnapshot = Array(22).fill(null);
+      state.participants = Array.from({ length: 22 }, (_, i) => defaultParticipant(i));
+      state.sessionUID = null;
+      state.lastFinalKey = '';
+      state.lastFinalPacketKey = '';
+      state.session = { type:0, name:'Unknown', detectedKind:'unknown', autoKind:state.currentPhase, kind:state.currentPhase, totalLaps:0, trackId:null };
+      state.currentPhase = currentFlow()[0];
+      state.completedPhases = {};
+      resetPitStopTracker();
+      addEvent('All saved race history, cached drivers and autosave data deleted. UDP settings were kept.');
+      broadcast();
+      return sendJson(res, { ok:true, state:snapshot() });
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type':'application/json' });
+      return res.end(JSON.stringify({ ok:false, error:err.message }));
+    }
+  }
   if (url.pathname === '/api/weekend-type') {
     const type = String(url.searchParams.get('type') || 'sprint');
     if (['standard','sprint'].includes(type)) {
@@ -1415,5 +1627,29 @@ const server = http.createServer((req, res) => {
     res.end(data);
   });
 });
-server.listen(WEB_PORT, () => console.log(`Web dashboard listening on http://localhost:${WEB_PORT}`));
+function findAvailableWebPort(startPort, maxPort = 3010) {
+  return new Promise((resolve, reject) => {
+    const tryPort = port => {
+      if (port > maxPort) return reject(new Error(`No free web port found between ${startPort} and ${maxPort}`));
+      const probe = net.createServer();
+      probe.unref();
+      probe.once('error', err => {
+        probe.close?.();
+        if (err.code === 'EADDRINUSE') return tryPort(port + 1);
+        reject(err);
+      });
+      probe.listen(port, '0.0.0.0', () => probe.close(() => resolve(port)));
+    };
+    tryPort(startPort);
+  });
+}
+
+findAvailableWebPort(WEB_PORT)
+  .then(port => {
+    if (port !== WEB_PORT) console.warn(`Web port ${WEB_PORT} is already in use; using ${port}.`);
+    WEB_PORT = port;
+    server.listen(WEB_PORT, '0.0.0.0', () => console.log(`Web dashboard listening on http://localhost:${WEB_PORT}`));
+  })
+  .catch(err => console.error('Web server error:', err));
+
 setInterval(broadcast, 500);
